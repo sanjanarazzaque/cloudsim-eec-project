@@ -244,30 +244,27 @@ void Scheduler::Init() {
     //      Get if there is a GPU or not
     // 
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
-    for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+    SimOutput("Scheduler::Init(): no startup VMs, creating on-demand", 1);
+
+    machines.clear();
+    vms.clear();
+    // looping through machines to set ID to index 
+    for(unsigned i = 0; i < Machine_GetTotal; i++) {
+        MachineId_t machine_id = static_cast<MachineId_t>(i);
+        machines.push_back(machine_id);
+
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S0) {
+            setPStateOfAllCoresOnMachine(machine_id, P1);
+        }
     }
 
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
-
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
+   
 }
-
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
+    SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) +
+              " completed migration at time " + to_string(time), 2);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -288,20 +285,22 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
+
+    SimOutput("Scheduler::NewTask(): task " + to_string(task_id) +
+              " arrived at " + to_string(now), 3);
+    if (trySchedulingTaskImmediately(task_id)) {
+        return;
     }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+    ThrowException("Scheduler::NewTask(): no valid placement found for task ", task_id);
 }
+   
 
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    SimOutput("Scheduler::PeriodicCheck(): time " + to_string(now), 4);
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -309,9 +308,6 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
-    for(auto & vm: vms) {
-        VM_Shutdown(vm);
-    }
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
@@ -325,21 +321,21 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
 // Public interface below
 
-static Scheduler Scheduler;
+static Scheduler SchedulerInstance;
 
 void InitScheduler() {
     SimOutput("InitScheduler(): Initializing scheduler", 4);
-    Scheduler.Init();
+    SchedulerInstance.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
     SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
-    Scheduler.NewTask(time, task_id);
+    SchedulerInstance.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
     SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
-    Scheduler.TaskComplete(time, task_id);
+    SchedulerInstance.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
@@ -350,20 +346,14 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
-    Scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
+    SchedulerInstance.MigrationComplete(time, vm_id);
 }
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
-    Scheduler.PeriodicCheck(time);
-    static unsigned counts = 0;
-    counts++;
-    if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
+    SchedulerInstance.PeriodicCheck(time);
+
 }
 
 void SimulationComplete(Time_t time) {

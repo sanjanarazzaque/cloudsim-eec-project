@@ -6,9 +6,233 @@
 //
 
 #include "Scheduler.hpp"
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <limits>
 
-static bool migrating = false;
+//maybe delete
 static unsigned active_machines = 16;
+
+using namespace std;
+namespace{
+    const MachineId_t NO_VALID_MACHINE = numeric_limits<MachineId_t>::max();
+    const VMId_t NO_VALID_VM = numeric_limits<VMId_t>::max();
+    const unsigned MEM_BUFFER = 16;
+
+    struct VMRecord{
+        static bool migrating = false;
+        //starting  w no vms until we get task
+        VMId_t vm_id = NO_VALID_VM;
+        VMType_t vm_type = LINUX;
+        CPUType_t cpu_type = X86;
+        MachineId_t machine_id = NO_VALID_MACHINE;
+        unordered_set<TaskId_t> cur_tasks;
+    };
+
+    unordered_map<VMId_t, VMRecord> map_vm_records;
+    unordered_map<TaskId_t, VMId_t> map_task_to_vm;
+
+    Priority_t findPriority(SLAType_t sla){
+        switch(sla){
+            case SLA0:
+            case SLA1:
+                return HIGH_PRIORITY;
+            case SLA2:
+                return MID_PRIORITY;
+            case SLA3:
+            default:
+                return LOW_PRIORITY;
+        }
+    }
+
+    bool checkMachineReady(MachineId_t machine_id){
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if(machine_info.s_state == S0){
+            return true;
+        } else{
+            return false;
+        }
+    }
+
+    bool machineCheckMemory(MachineId_t machine_id, TaskId_t task_id, bool create_new_vm){
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        unsigned mem_needed = GetTaskMemory(task_id) + MEM_BUFFER;
+        if(create_new_vm){
+            mem_needed += VM_MEMORY_OVERHEAD;
+        }
+        if(machine_info.memory_used > machine_info.memory_size){
+            return false;
+        }
+         return (machine_info.memory_size - machine_info.memory_used) >= mem_needed;
+    }
+
+    bool canVMTakeTask(const VMRecord& vmr, TaskId_t task_id){
+        if(vmr.migrating){
+            return false;
+        }
+        if(vmr.cpu_type != RequiredCPUType(task_id)){
+            return false;
+        }
+        if(vmr.vm_type != RequiredVMType(task_id)){
+            return false;
+        }
+        if(vmr.machine_id == NO_VALID_MACHINE){
+            return false;
+        }
+        if(!checkMachineReady(vmr.machine_id)){
+            return false;
+        }
+        return machineCheckMemory(vmr.machine_id, task_id, false);
+    }
+
+    int rankVMForTask(const VMRecord& vmr, TaskId_t task_id){
+        MachineInfo_t machine_info = Machine_GetInfo(vmr.machine_id);
+        int rank = 0;
+        //if machine has lots of active tasks, add penalty
+        rank += static_cast<int>(machine_info.active_tasks) * 20;
+        //if machine has active VMs this is good, bc we want to avoid creating new VMs
+        rank -= static_cast<int>(machine_info.active_vms) * 5;
+
+        if (IsTaskGPUCapable(task_id) && machine_info.gpus) {
+            rank -= 20;
+        } else if(IsTaskGPUCapable(task_id) && !machine_info.gpus){
+            rank += 15;
+        }
+
+        unsigned free_memory = (machine_info.memory_size >= machine_info.memory_used) ? (machine_info.memory_size - machine_info.memory_used) : 0;
+        if(free_memory > GetTaskMemory(task_id)){
+            rank+= static_cast<int>((free_memory - GetTaskMemory(task_id)) / 32);
+        }
+
+        return rank;
+
+    }
+
+    VMId_t findBestVMForTask(TaskId_t task_id){
+         VMId_t best_vm = NO_VALID_VM;
+         int best_rank = numeric_limits<int>::max();
+
+         for(auto& key : map_vm_records){
+            const VMRecord& vmr = key.second;
+            if(!canVMTakeTask(vmr, task_id)) continue;
+
+            int rank = rankVMForTask(vmr, task_id);
+            if(rank < best_rank){
+                best_rank = rank;
+                best_vm = vmr.vm_id;
+            }
+         }
+        return best_vm;
+    }
+
+    int rankMachineForNewVM(MachineId_t machine_id, TaskId_t task_id) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_info.cpu != RequiredCPUType(task_id)) {
+            return numeric_limits<int>::max();
+        }
+
+        if (machine_info.s_state != S0) {
+            return numeric_limits<int>::max();
+        }
+
+        if (!machineCheckMemory(machine_id, task_id, true)) {
+            return numeric_limits<int>::max();
+        }
+
+        int rank = 0;
+        rank += static_cast<int>(machine_info.active_tasks) * 20;
+        rank += static_cast<int>(machine_info.active_vms) * 8;
+
+        if (IsTaskGPUCapable(task_id) && machine_info.gpus) {
+            rank -= 25;
+        } else if (IsTaskGPUCapable(task_id) && !machine_info.gpus) {
+            rank += 10;
+        }
+
+        return rank;
+    }
+
+    MachineId_t findBestMachineForNewVM(TaskId_t task_id) {
+        MachineId_t best_machine = NO_VALID_MACHINE;
+        int best_rank = numeric_limits<int>::max();
+
+        unsigned total = Machine_GetTotal();
+        for (unsigned i = 0; i < total; i++) {
+            MachineId_t machine_id = static_cast<MachineId_t>(i);
+            int rank = rankMachineForNewVM(machine_id, task_id);
+            if (rank < best_rank) {
+                best_rank = rank;
+                best_machine = machine_id;
+            }
+        }
+
+        return best_machine;
+    }
+
+    void setPStateOfAllCoresOnMachine(MachineId_t machine_id, CPUPerformance_t pstate) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        for (unsigned core = 0; core < machine_info.num_cpus; core++) {
+            Machine_SetCorePerformance(machine_id, core, pstate);
+        }
+    }
+
+    void tryPlacingTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
+    auto vmr_iterator = map_vm_records.find(vm_id);
+    if (vmr_iterator == g_vm_records.end()) {
+        ThrowException("TryPlaceTaskOnVM(): can't find VM");
+        return;
+    }
+
+    Priority_t sla_priority = findPriority(RequiredSLA(task_id));
+    SetTaskPriority(task_id, sla_priority);
+    VM_AddTask(vm_id, task_id, sla_priority);
+
+    vmr_iterator->second.tasks.insert(task_id);
+    map_vm_records[task_id] = vm_id;
+    }
+
+    VMId_t attachVMAndPlaceTask(TaskId_t task_id, MachineId_t machine_id) {
+        VMType_t vm_type = RequiredVMType(task_id);
+        CPUType_t cpu_type = RequiredCPUType(task_id);
+        //create new vm and then attach to specific machine (which is ranked and chosen)
+        VMId_t vm_id = VM_Create(vm_type, cpu_type);
+        VM_Attach(vm_id, machine_id);
+
+        VMRecord rec;
+        rec.vm_id = vm_id;
+        rec.vm_type = vm_type;
+        rec.cpu = cpu_type;
+        rec.machine_id = machine_id;
+        rec.migrating = false;
+
+        map_vm_records[vm_id] = rec;
+        tryPlacingTaskOnVM(vm_id, task_id);
+        return vm_id;
+    }
+
+    bool trySchedulingTaskImmediately(TaskId_t task_id) {
+        VMId_t existing_vm = findBestVMForTask(task_id);
+        if (existing_vm != NO_VALID_VM) {
+            tryPlacingTaskOnVM(existing_vm, task_id);
+            return true;
+        }
+
+        MachineId_t awake_machine = findBestMachineForNewVM(task_id);
+        if (awake_machine != NO_VALID_MACHINE) {
+            attachVMAndPlaceTask(task_id, awake_machine);
+            return true;
+        }
+
+        return false;
+
+    }
+
+}
+
+
 
 void Scheduler::Init() {
     // Find the parameters of the clusters

@@ -33,6 +33,9 @@ namespace{
 
     unordered_map<VMId_t, VMRecord> map_vm_records;
     unordered_map<TaskId_t, VMId_t> map_task_to_vm;
+    unordered_map<MachineId_t, vector<TaskId_t>> tasks_waiting_for_machine;
+    unordered_set<MachineId_t> machines_waking;
+
 
     Priority_t findPriority(SLAType_t sla){
         switch(sla){
@@ -127,14 +130,27 @@ namespace{
         return best_vm;
     }
 
-    int rankMachineForNewVM(MachineId_t machine_id, TaskId_t task_id) {
+    int machineSleepRank(MachineState_t s){
+        switch(s){
+            case S0: return 0;
+            case S0i1: return 1;
+            case S1: return 2;
+            case S2: return 3;
+            case S3: return 4;
+            case S4: return 5;
+            case S5: return 6;
+            default: return 10;
+        }
+    }
+
+    int rankMachineForNewVM(MachineId_t machine_id, TaskId_t task_id, bool awake_only) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
         if (machine_info.cpu != RequiredCPUType(task_id)) {
             return numeric_limits<int>::max();
         }
 
-        if (machine_info.s_state != S0) {
+        if (awake_only && machine_info.s_state != S0) {
             return numeric_limits<int>::max();
         }
 
@@ -146,6 +162,10 @@ namespace{
         rank += static_cast<int>(machine_info.active_tasks) * 20;
         rank += static_cast<int>(machine_info.active_vms) * 8;
 
+        if(machine_info.s_state != S0){
+            rank += 100 + machineSleepRank(machine_info.s_state) * 40;
+        }
+
         if (IsTaskGPUCapable(task_id) && machine_info.gpus) {
             rank -= 25;
         } else if (IsTaskGPUCapable(task_id) && !machine_info.gpus) {
@@ -155,14 +175,14 @@ namespace{
         return rank;
     }
 
-    MachineId_t findBestMachineForNewVM(TaskId_t task_id) {
+    MachineId_t findBestMachineForNewVM(TaskId_t task_id, bool awake_only) {
         MachineId_t best_machine = NO_VALID_MACHINE;
         int best_rank = numeric_limits<int>::max();
 
         unsigned total = Machine_GetTotal();
         for (unsigned i = 0; i < total; i++) {
             MachineId_t machine_id = static_cast<MachineId_t>(i);
-            int rank = rankMachineForNewVM(machine_id, task_id);
+            int rank = rankMachineForNewVM(machine_id, task_id, awake_only);
             if (rank < best_rank) {
                 best_rank = rank;
                 best_machine = machine_id;
@@ -170,6 +190,11 @@ namespace{
         }
 
         return best_machine;
+    }
+
+    bool checkIfCPUsAlign(MachineId_t machine_id, TaskId_t task_id){
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        return machine_info.cpu == RequiredCPUType(task_id);
     }
 
     void setPStateOfAllCoresOnMachine(MachineId_t machine_id, CPUPerformance_t pstate) {
@@ -220,7 +245,7 @@ namespace{
             return true;
         }
 
-        MachineId_t awake_machine = findBestMachineForNewVM(task_id);
+        MachineId_t awake_machine = findBestMachineForNewVM(task_id, true);
         if (awake_machine != NO_VALID_MACHINE) {
             attachVMAndPlaceTask(task_id, awake_machine);
             return true;
@@ -228,6 +253,44 @@ namespace{
 
         return false;
 
+    }
+
+    MachineId_t chooseMachineToWakeUp(TaskId_t task_id){
+        MachineId_t best_machine = NO_VALID_MACHINE;
+        int best_rank = numeric_limits<int>::max();
+
+        unsigned total_mach = Machine_GetTotal();
+        for(unsigned i = 0; i < total_mach; i++){
+            MachineId_t machine_id = static_cast<MachineId_t>(i);
+            //first check if task aligns w that machine
+            if (!checkIfCPUsAlign(machine_id, task_id)) continue;
+            //check if machine has space for that task
+            if(!machineCheckMemory(machine_id, task_id, true)) continue;
+            //skip machine if it is already waking up
+            if(machines_waking.count(machine_id)) continue;
+            //if its awake move on
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            if(machine_info.s_state == S0) continue;
+            int rank = rankMachineForNewVM(machine_id, task_id, false);
+            if(rank < best_rank){
+                best_rank = rank;
+                best_machine = machine_id;
+            }
+        }
+
+        return best_machine;
+    }
+
+    void storeTaskInMachineWaiting(TaskId_t task_id, MachineId_t machine_id){
+        tasks_waiting_for_machine[machine_id].push_back(task_id);
+        if(!machines_waking.count(machine_id)){
+            machines_waking.insert(machine_id);
+            Machine_SetState(machine_id, S0);
+            SimOutput("QueueTaskForWake(): waking machine " + to_string(machine_id) +
+                  " for task " + to_string(task_id), 2);
+
+        }
+        
     }
 
 }
@@ -366,14 +429,20 @@ void SimulationComplete(Time_t time) {
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
     
-    Scheduler.Shutdown(time);
+    SchedulerInstance.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    SimOutput("SLAWarning(): the task " + to_string(task_id) +
+    " warned at time: " + to_string(time), 1);
+    SetTaskPriority(task_id, HIGH_PRIORITY);
+
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
+    SimOutput("StateChangeComplete(): the machine " + to_string(machine_id) +
+    " changed state at time: " + to_string(time), 3);
+
 }
 

@@ -20,6 +20,12 @@ namespace{
     const MachineId_t NO_VALID_MACHINE = numeric_limits<MachineId_t>::max();
     const VMId_t NO_VALID_VM = numeric_limits<VMId_t>::max();
     const unsigned MEM_BUFFER = 16;
+    // track when to decide to move machine to deep sleep 
+    const unsigned IDLE_TO_S0I1_CHECKS = 1;
+    const unsigned IDLE_TO_S1_CHECKS   = 3;
+    const unsigned IDLE_TO_S3_CHECKS   = 6;
+    const unsigned IDLE_TO_S5_CHECKS   = 10;
+
 
     struct VMRecord{
         static bool migrating = false;
@@ -35,6 +41,7 @@ namespace{
     unordered_map<TaskId_t, VMId_t> map_task_to_vm;
     unordered_map<MachineId_t, vector<TaskId_t>> tasks_waiting_for_machine;
     unordered_set<MachineId_t> machines_waking;
+    unordered_map<MachineId_t, unsigned> idle_checks_map;
 
 
     Priority_t findPriority(SLAType_t sla){
@@ -88,6 +95,16 @@ namespace{
             return false;
         }
         return machineCheckMemory(vmr.machine_id, task_id, false);
+    }
+
+    bool checkVMForSLAs(constVMRecord& vmr){
+         for (TaskId_t t : vmr.tasks) {
+        SLAType_t sla = RequiredSLA(t);
+        if (sla == SLA0 || sla == SLA1) {
+            return true;
+        }
+    }
+    return false;
     }
 
     int rankVMForTask(const VMRecord& vmr, TaskId_t task_id){
@@ -205,18 +222,21 @@ namespace{
     }
 
     void tryPlacingTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
-    auto vmr_iterator = map_vm_records.find(vm_id);
-    if (vmr_iterator == g_vm_records.end()) {
-        ThrowException("TryPlaceTaskOnVM(): can't find VM");
-        return;
-    }
+        auto vmr_iterator = map_vm_records.find(vm_id);
+        if (vmr_iterator == g_vm_records.end()) {
+            ThrowException("TryPlaceTaskOnVM(): can't find VM");
+            return;
+        }
 
-    Priority_t sla_priority = findPriority(RequiredSLA(task_id));
-    SetTaskPriority(task_id, sla_priority);
-    VM_AddTask(vm_id, task_id, sla_priority);
+        Priority_t sla_priority = findPriority(RequiredSLA(task_id));
+        SetTaskPriority(task_id, sla_priority);
+        VM_AddTask(vm_id, task_id, sla_priority);
 
-    vmr_iterator->second.tasks.insert(task_id);
-    map_vm_records[task_id] = vm_id;
+        vmr_iterator->second.tasks.insert(task_id);
+        map_vm_records[task_id] = vm_id;
+        // machine isn't idle since we added a task 
+        MachineId_t machine_id = vmr_iterator->second.machine_id;
+        idle_checks_map[machine_id] = 0;
     }
 
     VMId_t attachVMAndPlaceTask(TaskId_t task_id, MachineId_t machine_id) {
@@ -286,11 +306,87 @@ namespace{
         if(!machines_waking.count(machine_id)){
             machines_waking.insert(machine_id);
             Machine_SetState(machine_id, S0);
-            SimOutput("QueueTaskForWake(): waking machine " + to_string(machine_id) +
+            SimOutput("storeTaskInMachineWaiting(): waking machine " + to_string(machine_id) +
                   " for task " + to_string(task_id), 2);
 
         }
         
+    }
+
+    void decideMachinePerformance(MachineId_t machine_id) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_info.s_state != S0 || machine_info.active_tasks == 0) {
+            return;
+        }
+
+        bool needs_p0= false;
+        for (auto& kv : map_vm_records) {
+            const VMRecord& vmr = kv.second;
+            if (vmr.machine_id != machine_id) 
+                continue;
+            if (checkVMForSLAs(vmr)) {
+                needs_p0 = true;
+                break;
+            }
+        }
+
+        if (needs_p0 || machine_info.active_tasks >= machine_info.num_cpus) {
+            setPStateOfAllCoresOnMachine(machine_id, P0);
+        } else if (machine_info.active_tasks > 0) {
+            setPStateOfAllCoresOnMachine(machine_id, P1);
+        }
+    }
+
+    void removeFinishedTaskFromMap(TaskId_t task_id) {
+        auto iter = map_task_to_vm.find(task_id);
+        if (iter == map_task_to_vm.end()) return;
+
+        VMId_t vm_id = iter->second;
+        auto vm_iterator = map_vm_records.find(vm_id);
+        if (vm_iterator != map_vm_records.end()) {
+            vm_iterator->second.tasks.erase(task_id);
+        }
+        map_task_to_vm.erase(iter);
+    }
+
+    void shutdownEmptyVM(VMId_t vm_id) {
+        auto iter = map_vm_records.find(vm_id);
+        if (iter == map_vm_records.end()) 
+            return;
+        if (iter->second.migrating) 
+            return;
+        if (!iter->second.tasks.empty()) 
+            return;
+        VM_Shutdown(vm_id);
+        MachineId_t machine_id = iter->second.machine_id;
+        map_vm_records.erase(iter);
+        idle_checks_map[machine_id] = 0;
+    }
+
+    void lowerIdleMachineState(MachineId_t machine_id) {
+        if (machines_waking.count(machine_id)) 
+            return;
+
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_info.active_vms > 0 || machine_info.active_tasks > 0) {
+            idle_checks_map[machine_id] = 0;
+            return;
+        }
+
+        unsigned idle_num = ++idle_checks_map[machine_id];
+
+        if (idle_num >= IDLE_TO_S5_CHECKS && machine_info.s_state != S5) {
+            Machine_SetState(machine_id, S5);
+        } else if (idle >= IDLE_TO_S3_CHECKS && machine_info.s_state != S3 && machine_info.s_state != S4 && machine_info.s_state != S5) {
+            Machine_SetState(machine_id, S3);
+        } else if (idle_num >= IDLE_TO_S1_CHECKS && machine_info.s_state == S0i1) {
+            Machine_SetState(machine_id, S1);
+        } else if (idle_num >= IDLE_TO_S0I1_CHECKS && machine_info.s_state == S0) {
+            Machine_SetState(machine_id, S0i1);
+        }
+
     }
 
 }
@@ -315,6 +411,7 @@ void Scheduler::Init() {
     for(unsigned i = 0; i < Machine_GetTotal; i++) {
         MachineId_t machine_id = static_cast<MachineId_t>(i);
         machines.push_back(machine_id);
+        idle_checks_map[machine_id] = 0;
 
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
         if (machine_info.s_state == S0) {
@@ -364,6 +461,12 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     SimOutput("Scheduler::PeriodicCheck(): time " + to_string(now), 4);
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t machine_id = static_cast<MachineId_t>(i);
+        decideMachinePerformance(machine_id);
+        lowerIdleMachineState(machine_id);
+    }
+
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -380,6 +483,22 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+
+    auto iter = map_task_to_vm.find(task_id);
+    if (iter == map_task_to_vm.end()) {
+        return;
+    }
+
+    VMId_t vm_id = iter->second;
+
+    try {
+        VM_RemoveTask(vm_id, task_id);
+    } catch (...) {
+    }
+
+    removeFinishedTaskFromMap(task_id);
+    shutdownEmptyVM(vm_id);
+
 }
 
 // Public interface below
@@ -443,6 +562,26 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
     SimOutput("StateChangeComplete(): the machine " + to_string(machine_id) +
     " changed state at time: " + to_string(time), 3);
+
+    machines_waking.erase(machine_id);
+    idle_checks_map[machine_id] = 0;
+
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    if (machine_info.s_state != S0) {
+        return;
+    }
+
+    auto wait_iter = tasks_waiting_for_machine.find(machine_id);
+    if (wait_iter == tasks_waiting_for_machine.end()) {
+        return;
+    }
+
+    vector<TaskId_t> tasks_waiting = wait_iter->second;
+    tasks_waiting_for_machine.erase(wait_iter);
+
+    for (TaskId_t task_id : tasks_waiting) {
+        SchedulerInstance.NewTask(time, task_id);
+    }
 
 }
 

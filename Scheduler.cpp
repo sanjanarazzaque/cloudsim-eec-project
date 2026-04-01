@@ -42,6 +42,7 @@ namespace{
     unordered_map<MachineId_t, vector<TaskId_t>> tasks_waiting_for_machine;
     unordered_set<MachineId_t> machines_waking;
     unordered_map<MachineId_t, unsigned> idle_checks_map;
+    bool control_migration = false;
 
 
     Priority_t findPriority(SLAType_t sla){
@@ -105,6 +106,13 @@ namespace{
         }
     }
     return false;
+    }
+
+    bool checkVMForGPUTasks(const VMRecord& vmr){
+        for(TaskId_t t: vmr.tasks){
+            if(IsTaskGPUCapable(t)) return true;
+        }
+        return false;
     }
 
     int rankVMForTask(const VMRecord& vmr, TaskId_t task_id){
@@ -313,6 +321,74 @@ namespace{
         
     }
 
+    bool canMigratingVMFitOnMachine(const VMRecord& vmr, MachineId_t dest){
+        MachineInfo_t dst_mach = Machine_GetInfo(dest);
+        unsigned mem_needed = VM_MEMORY_OVERHEAD + MEM_BUFFER;
+        for (TaskId_t t : vmr.tasks) {
+            mem_needed += GetTaskMemory(t);
+        }
+
+        if (dst_mach.memory_used > dst_mach.memory_size) return false;
+        return (dst_mach.memory_size - dst_mach.memory_used) >= mem_needed;
+
+    }
+
+    bool canVMMigrate(const VMRecord& vmr, MachineId_t dest){
+        MachineInfo_t dst_mach = Machine_GetInfo(dest);
+        if (dst_mach.s_state != S0) return false;
+        if (dst_mach.cpu != vmr.cpu) return false;
+        if (dst_mach.machine_id == vmr.machine_id) return false;
+        if (!canMigratingVMFitOnMachine(vmr, dest)) return false;
+        return true;
+
+    }
+
+    void consolidateVMs(){
+        if (control_migration) return;
+
+        VMId_t best_vm = NO_VALID_VM;
+        MachineId_t best_dst = NO_VALID_MACHINE;
+
+        for (auto& kv : map_vm_records) {
+            VMRecord& vmr = kv.second;
+            if (vmr.tasks.empty()) continue;
+            if (vmr.migrating) continue;
+
+            MachineInfo_t src = Machine_GetInfo(vmr.machine_id);
+
+            if (src.active_tasks > 1) continue;
+            if (src.active_vms != 1) continue;
+            if (checkVMForSLAs(vmr)) continue;
+
+            for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+                MachineId_t dst_machine = static_cast<MachineId_t>(i);
+                if (!canVMMigrate(vmr, dst_machine)) continue;
+
+                MachineInfo_t dst = Machine_GetInfo(dst_machine);
+
+                if (dst.active_tasks == 0) continue;
+
+                if (checkVMForGPUTasks(vmr) && !dst.gpus) continue;
+
+                best_vm = vmr.vm_id;
+                best_dst = dst_machine;
+                break;
+            }
+
+            if (best_vm != NO_VALID_VM) break;
+        }
+
+        if (best_vm != NO_VALID_VM && best_dst != NO_VALID_MACHINE) {
+            map_vm_records[best_vm].migrating = true;
+            control_migration = true;
+            SimOutput("consolidateVMs(): migrating VM " + to_string(best_vm) +
+                    " to machine " + to_string(best_dst), 2);
+            VM_Migrate(best_vm, best_dst);
+        }
+
+    }
+
+
     void decideMachinePerformance(MachineId_t machine_id) {
         MachineInfo_t machine_info = Machine_GetInfo(machine_id);
 
@@ -379,7 +455,7 @@ namespace{
 
         if (idle_num >= IDLE_TO_S5_CHECKS && machine_info.s_state != S5) {
             Machine_SetState(machine_id, S5);
-        } else if (idle >= IDLE_TO_S3_CHECKS && machine_info.s_state != S3 && machine_info.s_state != S4 && machine_info.s_state != S5) {
+        } else if (idle_num >= IDLE_TO_S3_CHECKS && machine_info.s_state != S3 && machine_info.s_state != S4 && machine_info.s_state != S5) {
             Machine_SetState(machine_id, S3);
         } else if (idle_num >= IDLE_TO_S1_CHECKS && machine_info.s_state == S0i1) {
             Machine_SetState(machine_id, S1);
@@ -422,6 +498,15 @@ void Scheduler::Init() {
    
 }
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
+     auto iter = map_vm_records.find(vm_id);
+     if (iter != map_vm_records.end()) {
+        iter->second.migrating = false;
+        VMInfo_t machine_info = VM_GetInfo(vm_id);
+        iter->second.machine_id = machine_info.machine_id;
+    }
+
+    control_migration = false;
+
     // Update your data structure. The VM now can receive new tasks
     SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) +
               " completed migration at time " + to_string(time), 2);
@@ -451,6 +536,25 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     if (trySchedulingTaskImmediately(task_id)) {
         return;
     }
+    MachineId_t sleeping_machine = chooseMachineToWakeUp(task_id);
+    if (sleeping_machine != NO_VALID_MACHINE) {
+        storeTaskInMachineWaiting(task_id, sleeping_machine);
+        return;
+    }
+
+    for (auto& kv : g_vm_records) {
+        const VMRecord& vmr = kv.second;
+        if (vmr.migrating) continue;
+        if (vmr.vm_type != RequiredVMType(task_id)) continue;
+        if (vmr.cpu != RequiredCPUType(task_id)) continue;
+        if (!checkMachineReady(vmr.machine_id)) continue;
+
+        tryPlacingTaskOnVM(vmr.vm_id, task_id);
+        SimOutput("Scheduler::NewTask(): used last-resort placement for task " +
+                  to_string(task_id), 1);
+        return;
+    }
+
     ThrowException("Scheduler::NewTask(): no valid placement found for task ", task_id);
 }
    
@@ -467,6 +571,8 @@ void Scheduler::PeriodicCheck(Time_t now) {
         lowerIdleMachineState(machine_id);
     }
 
+    consolidateVMs();
+
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -474,6 +580,19 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
+    vector<VMId_t> vm_ids;
+    vm_ids.reserve(map_vm_records.size());
+    for (auto& kv : map_vm_records) {
+        vm_ids.push_back(kv.first);
+    }
+
+    for (VMId_t vm_id : vm_ids) {
+        try {
+            VM_Shutdown(vm_id);
+        } catch (...) {
+        }
+    }
+
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
@@ -523,6 +642,27 @@ void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
     // The simulator is alerting you that machine identified by machine_id is overcommitted
     SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+    if (machine_info.s_state == S0) {
+        setPStateOfAllCoresOnMachine(machine_id, P0);
+    }
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t candidate = static_cast<MachineId_t>(i);
+        if (candidate == machine_id) continue;
+
+        MachineInfo_t cinfo = Machine_GetInfo(candidate);
+        if (cinfo.cpu != machine_info.cpu) continue;
+        if (cinfo.s_state == S0) continue;
+        if (machines_waking.count(candidate)) continue;
+
+        machines_waking.insert(candidate);
+        Machine_SetState(candidate, S0);
+        SimOutput("MemoryWarning(): proactively waking machine " +
+                  to_string(candidate), 2);
+        break;
+    }
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
@@ -555,6 +695,37 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
     SimOutput("SLAWarning(): the task " + to_string(task_id) +
     " warned at time: " + to_string(time), 1);
     SetTaskPriority(task_id, HIGH_PRIORITY);
+    auto iter = map_task_to_vm.find(task_id);
+    if (iter != map_task_to_vm.end()) {
+        VMId_t vm_id = iter->second;
+        auto vm_it = map_vm_records.find(vm_id);
+        if (vm_it != map_vm_records.end()) {
+            MachineId_t machine_id = vm_it->second.machine_id;
+            if (machine_id != NO_VALID_MACHINE) {
+                MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+                if (machine_info.s_state == S0) {
+                    setPStateOfAllCoresOnMachine(machine_id, P0);
+                }
+            }
+        }
+    }
+
+    CPUType_t cpu = RequiredCPUType(task_id);
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t machine_id = static_cast<MachineId_t>(i);
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+        if (machine_info.cpu != cpu) continue;
+        if (machine_info.s_state == S0) continue;
+        if (machines_waking.count(machine_id)) continue;
+
+        machines_waking.insert(machine_id);
+        Machine_SetState(machine_id, S0);
+        SimOutput("SLAWarning(): waking machine " + to_string(machine_id) +
+                  " for SLA protection", 2);
+        break;
+    }
+
 
 }
 

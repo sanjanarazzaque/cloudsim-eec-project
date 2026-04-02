@@ -28,13 +28,13 @@ namespace{
 
 
     struct VMRecord{
-        static bool migrating = false;
+        bool migrating = false;
         //starting  w no vms until we get task
         VMId_t vm_id = NO_VALID_VM;
         VMType_t vm_type = LINUX;
-        CPUType_t cpu_type = X86;
+        CPUType_t cpu = X86;
         MachineId_t machine_id = NO_VALID_MACHINE;
-        unordered_set<TaskId_t> cur_tasks;
+        unordered_set<TaskId_t> tasks;
     };
 
     unordered_map<VMId_t, VMRecord> map_vm_records;
@@ -83,7 +83,7 @@ namespace{
         if(vmr.migrating){
             return false;
         }
-        if(vmr.cpu_type != RequiredCPUType(task_id)){
+        if(vmr.cpu != RequiredCPUType(task_id)){
             return false;
         }
         if(vmr.vm_type != RequiredVMType(task_id)){
@@ -98,7 +98,7 @@ namespace{
         return machineCheckMemory(vmr.machine_id, task_id, false);
     }
 
-    bool checkVMForSLAs(constVMRecord& vmr){
+    bool checkVMForSLAs(const VMRecord& vmr){
          for (TaskId_t t : vmr.tasks) {
         SLAType_t sla = RequiredSLA(t);
         if (sla == SLA0 || sla == SLA1) {
@@ -231,7 +231,7 @@ namespace{
 
     void tryPlacingTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
         auto vmr_iterator = map_vm_records.find(vm_id);
-        if (vmr_iterator == g_vm_records.end()) {
+        if (vmr_iterator == map_vm_records.end()) {
             ThrowException("TryPlaceTaskOnVM(): can't find VM");
             return;
         }
@@ -241,7 +241,7 @@ namespace{
         VM_AddTask(vm_id, task_id, sla_priority);
 
         vmr_iterator->second.tasks.insert(task_id);
-        map_vm_records[task_id] = vm_id;
+        map_task_to_vm[task_id] = vm_id;
         // machine isn't idle since we added a task 
         MachineId_t machine_id = vmr_iterator->second.machine_id;
         idle_checks_map[machine_id] = 0;
@@ -249,15 +249,15 @@ namespace{
 
     VMId_t attachVMAndPlaceTask(TaskId_t task_id, MachineId_t machine_id) {
         VMType_t vm_type = RequiredVMType(task_id);
-        CPUType_t cpu_type = RequiredCPUType(task_id);
+        CPUType_t cpu = RequiredCPUType(task_id);
         //create new vm and then attach to specific machine (which is ranked and chosen)
-        VMId_t vm_id = VM_Create(vm_type, cpu_type);
+        VMId_t vm_id = VM_Create(vm_type, cpu);
         VM_Attach(vm_id, machine_id);
 
         VMRecord rec;
         rec.vm_id = vm_id;
         rec.vm_type = vm_type;
-        rec.cpu = cpu_type;
+        rec.cpu = cpu;
         rec.machine_id = machine_id;
         rec.migrating = false;
 
@@ -484,7 +484,7 @@ void Scheduler::Init() {
     machines.clear();
     vms.clear();
     // looping through machines to set ID to index 
-    for(unsigned i = 0; i < Machine_GetTotal; i++) {
+    for(unsigned i = 0; i < Machine_GetTotal(); i++) {
         MachineId_t machine_id = static_cast<MachineId_t>(i);
         machines.push_back(machine_id);
         idle_checks_map[machine_id] = 0;
@@ -542,7 +542,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         return;
     }
 
-    for (auto& kv : g_vm_records) {
+    for (auto& kv : map_vm_records) {
         const VMRecord& vmr = kv.second;
         if (vmr.migrating) continue;
         if (vmr.vm_type != RequiredVMType(task_id)) continue;

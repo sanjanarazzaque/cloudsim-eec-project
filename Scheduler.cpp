@@ -10,617 +10,719 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <deque>
 #include <limits>
-
-//maybe delete
-static unsigned active_machines = 16;
+#include <string>
 
 using namespace std;
-namespace{
-    const MachineId_t NO_VALID_MACHINE = numeric_limits<MachineId_t>::max();
-    const VMId_t NO_VALID_VM = numeric_limits<VMId_t>::max();
-    const unsigned MEM_BUFFER = 16;
-    // track when to decide to move machine to deep sleep 
-    const unsigned IDLE_TO_S0I1_CHECKS = 1;
-    const unsigned IDLE_TO_S1_CHECKS   = 3;
-    const unsigned IDLE_TO_S3_CHECKS   = 6;
-    const unsigned IDLE_TO_S5_CHECKS   = 10;
 
+namespace {
 
-    struct VMRecord{
-        bool migrating = false;
-        //starting  w no vms until we get task
-        VMId_t vm_id = NO_VALID_VM;
-        VMType_t vm_type = LINUX;
-        CPUType_t cpu = X86;
-        MachineId_t machine_id = NO_VALID_MACHINE;
-        unordered_set<TaskId_t> tasks;
-    };
+const MachineId_t NO_VALID_MACHINE = numeric_limits<MachineId_t>::max();
+const VMId_t NO_VALID_VM = numeric_limits<VMId_t>::max();
 
-    unordered_map<VMId_t, VMRecord> map_vm_records;
-    unordered_map<TaskId_t, VMId_t> map_task_to_vm;
-    unordered_map<MachineId_t, vector<TaskId_t>> tasks_waiting_for_machine;
-    unordered_set<MachineId_t> machines_waking;
-    unordered_map<MachineId_t, unsigned> idle_checks_map;
-    bool control_migration = false;
+const unsigned MEM_BUFFER = 16;
+const unsigned IDLE_TO_S0I1_CHECKS = 1;
+const unsigned IDLE_TO_S1_CHECKS   = 3;
+const unsigned IDLE_TO_S3_CHECKS   = 6;
+const unsigned IDLE_TO_S5_CHECKS   = 10;
 
+const double CONSOLIDATE_LOW_UTIL  = 0.25;
+const double CONSOLIDATE_HIGH_UTIL = 0.80;
 
-    Priority_t findPriority(SLAType_t sla){
-        switch(sla){
-            case SLA0:
-            case SLA1:
-                return HIGH_PRIORITY;
-            case SLA2:
-                return MID_PRIORITY;
-            case SLA3:
-            default:
-                return LOW_PRIORITY;
-        }
+enum AlgorithmKind {
+    GREEDY_BEST_FIT = 0,
+    SLA_AWARE = 1,
+    GPU_FIRST = 2,
+    THRESHOLD_CONSOLIDATION = 3
+};
+
+// change for the diff algos
+const AlgorithmKind ACTIVE_ALGO = GREEDY_BEST_FIT;
+
+struct VMRecord {
+    bool migrating = false;
+    VMId_t vm_id = NO_VALID_VM;
+    VMType_t vm_type = LINUX;
+    CPUType_t cpu = X86;
+    MachineId_t machine_id = NO_VALID_MACHINE;
+    unordered_set<TaskId_t> tasks;
+};
+
+unordered_map<VMId_t, VMRecord> map_vm_records;
+unordered_map<TaskId_t, VMId_t> map_task_to_vm;
+unordered_map<MachineId_t, deque<TaskId_t>> tasks_waiting_for_machine;
+deque<TaskId_t> global_waiting_tasks;
+
+unordered_set<MachineId_t> machines_waking;
+unordered_set<MachineId_t> machines_sleeping;
+unordered_map<MachineId_t, unsigned> idle_checks_map;
+
+bool control_migration = false;
+
+string algoName() {
+    switch (ACTIVE_ALGO) {
+        case GREEDY_BEST_FIT: return "GREEDY_BEST_FIT";
+        case SLA_AWARE: return "SLA_AWARE";
+        case GPU_FIRST: return "GPU_FIRST";
+        case THRESHOLD_CONSOLIDATION: return "THRESHOLD_CONSOLIDATION";
+        default: return "UNKNOWN";
     }
-
-    bool checkMachineReady(MachineId_t machine_id){
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if(machine_info.s_state == S0){
-            return true;
-        } else{
-            return false;
-        }
-    }
-
-    bool machineCheckMemory(MachineId_t machine_id, TaskId_t task_id, bool create_new_vm){
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        unsigned mem_needed = GetTaskMemory(task_id) + MEM_BUFFER;
-        if(create_new_vm){
-            mem_needed += VM_MEMORY_OVERHEAD;
-        }
-        if(machine_info.memory_used > machine_info.memory_size){
-            return false;
-        }
-         return (machine_info.memory_size - machine_info.memory_used) >= mem_needed;
-    }
-
-    bool canVMTakeTask(const VMRecord& vmr, TaskId_t task_id){
-        if(vmr.migrating){
-            return false;
-        }
-        if(vmr.cpu != RequiredCPUType(task_id)){
-            return false;
-        }
-        if(vmr.vm_type != RequiredVMType(task_id)){
-            return false;
-        }
-        if(vmr.machine_id == NO_VALID_MACHINE){
-            return false;
-        }
-        if(!checkMachineReady(vmr.machine_id)){
-            return false;
-        }
-        return machineCheckMemory(vmr.machine_id, task_id, false);
-    }
-
-    bool checkVMForSLAs(const VMRecord& vmr){
-         for (TaskId_t t : vmr.tasks) {
-        SLAType_t sla = RequiredSLA(t);
-        if (sla == SLA0 || sla == SLA1) {
-            return true;
-        }
-    }
-    return false;
-    }
-
-    bool checkVMForGPUTasks(const VMRecord& vmr){
-        for(TaskId_t t: vmr.tasks){
-            if(IsTaskGPUCapable(t)) return true;
-        }
-        return false;
-    }
-
-    int rankVMForTask(const VMRecord& vmr, TaskId_t task_id){
-        MachineInfo_t machine_info = Machine_GetInfo(vmr.machine_id);
-        int rank = 0;
-        //if machine has lots of active tasks, add penalty
-        rank += static_cast<int>(machine_info.active_tasks) * 20;
-        //if machine has active VMs this is good, bc we want to avoid creating new VMs
-        rank -= static_cast<int>(machine_info.active_vms) * 5;
-
-        if (IsTaskGPUCapable(task_id) && machine_info.gpus) {
-            rank -= 20;
-        } else if(IsTaskGPUCapable(task_id) && !machine_info.gpus){
-            rank += 15;
-        }
-
-        unsigned free_memory = (machine_info.memory_size >= machine_info.memory_used) ? (machine_info.memory_size - machine_info.memory_used) : 0;
-        if(free_memory > GetTaskMemory(task_id)){
-            rank+= static_cast<int>((free_memory - GetTaskMemory(task_id)) / 32);
-        }
-
-        return rank;
-
-    }
-
-    VMId_t findBestVMForTask(TaskId_t task_id){
-         VMId_t best_vm = NO_VALID_VM;
-         int best_rank = numeric_limits<int>::max();
-
-         for(auto& key : map_vm_records){
-            const VMRecord& vmr = key.second;
-            if(!canVMTakeTask(vmr, task_id)) continue;
-
-            int rank = rankVMForTask(vmr, task_id);
-            if(rank < best_rank){
-                best_rank = rank;
-                best_vm = vmr.vm_id;
-            }
-         }
-        return best_vm;
-    }
-
-    int machineSleepRank(MachineState_t s){
-        switch(s){
-            case S0: return 0;
-            case S0i1: return 1;
-            case S1: return 2;
-            case S2: return 3;
-            case S3: return 4;
-            case S4: return 5;
-            case S5: return 6;
-            default: return 10;
-        }
-    }
-
-    int rankMachineForNewVM(MachineId_t machine_id, TaskId_t task_id, bool awake_only) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-
-        if (machine_info.cpu != RequiredCPUType(task_id)) {
-            return numeric_limits<int>::max();
-        }
-
-        if (awake_only && machine_info.s_state != S0) {
-            return numeric_limits<int>::max();
-        }
-
-        if (!machineCheckMemory(machine_id, task_id, true)) {
-            return numeric_limits<int>::max();
-        }
-
-        int rank = 0;
-        rank += static_cast<int>(machine_info.active_tasks) * 20;
-        rank += static_cast<int>(machine_info.active_vms) * 8;
-
-        if(machine_info.s_state != S0){
-            rank += 100 + machineSleepRank(machine_info.s_state) * 40;
-        }
-
-        if (IsTaskGPUCapable(task_id) && machine_info.gpus) {
-            rank -= 25;
-        } else if (IsTaskGPUCapable(task_id) && !machine_info.gpus) {
-            rank += 10;
-        }
-
-        return rank;
-    }
-
-    MachineId_t findBestMachineForNewVM(TaskId_t task_id, bool awake_only) {
-        MachineId_t best_machine = NO_VALID_MACHINE;
-        int best_rank = numeric_limits<int>::max();
-
-        unsigned total = Machine_GetTotal();
-        for (unsigned i = 0; i < total; i++) {
-            MachineId_t machine_id = static_cast<MachineId_t>(i);
-            int rank = rankMachineForNewVM(machine_id, task_id, awake_only);
-            if (rank < best_rank) {
-                best_rank = rank;
-                best_machine = machine_id;
-            }
-        }
-
-        return best_machine;
-    }
-
-    bool checkIfCPUsAlign(MachineId_t machine_id, TaskId_t task_id){
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        return machine_info.cpu == RequiredCPUType(task_id);
-    }
-
-    void setPStateOfAllCoresOnMachine(MachineId_t machine_id, CPUPerformance_t pstate) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        for (unsigned core = 0; core < machine_info.num_cpus; core++) {
-            Machine_SetCorePerformance(machine_id, core, pstate);
-        }
-    }
-
-    void tryPlacingTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
-        auto vmr_iterator = map_vm_records.find(vm_id);
-        if (vmr_iterator == map_vm_records.end()) {
-            ThrowException("TryPlaceTaskOnVM(): can't find VM");
-            return;
-        }
-
-        Priority_t sla_priority = findPriority(RequiredSLA(task_id));
-        SetTaskPriority(task_id, sla_priority);
-        VM_AddTask(vm_id, task_id, sla_priority);
-
-        vmr_iterator->second.tasks.insert(task_id);
-        map_task_to_vm[task_id] = vm_id;
-        // machine isn't idle since we added a task 
-        MachineId_t machine_id = vmr_iterator->second.machine_id;
-        idle_checks_map[machine_id] = 0;
-    }
-
-    VMId_t attachVMAndPlaceTask(TaskId_t task_id, MachineId_t machine_id) {
-        VMType_t vm_type = RequiredVMType(task_id);
-        CPUType_t cpu = RequiredCPUType(task_id);
-        //create new vm and then attach to specific machine (which is ranked and chosen)
-        VMId_t vm_id = VM_Create(vm_type, cpu);
-        VM_Attach(vm_id, machine_id);
-
-        VMRecord rec;
-        rec.vm_id = vm_id;
-        rec.vm_type = vm_type;
-        rec.cpu = cpu;
-        rec.machine_id = machine_id;
-        rec.migrating = false;
-
-        map_vm_records[vm_id] = rec;
-        tryPlacingTaskOnVM(vm_id, task_id);
-        return vm_id;
-    }
-
-    bool trySchedulingTaskImmediately(TaskId_t task_id) {
-        VMId_t existing_vm = findBestVMForTask(task_id);
-        if (existing_vm != NO_VALID_VM) {
-            tryPlacingTaskOnVM(existing_vm, task_id);
-            return true;
-        }
-
-        MachineId_t awake_machine = findBestMachineForNewVM(task_id, true);
-        if (awake_machine != NO_VALID_MACHINE) {
-            attachVMAndPlaceTask(task_id, awake_machine);
-            return true;
-        }
-
-        return false;
-
-    }
-
-    MachineId_t chooseMachineToWakeUp(TaskId_t task_id){
-        MachineId_t best_machine = NO_VALID_MACHINE;
-        int best_rank = numeric_limits<int>::max();
-
-        unsigned total_mach = Machine_GetTotal();
-        for(unsigned i = 0; i < total_mach; i++){
-            MachineId_t machine_id = static_cast<MachineId_t>(i);
-            //first check if task aligns w that machine
-            if (!checkIfCPUsAlign(machine_id, task_id)) continue;
-            //check if machine has space for that task
-            if(!machineCheckMemory(machine_id, task_id, true)) continue;
-            //skip machine if it is already waking up
-            if(machines_waking.count(machine_id)) continue;
-            //if its awake move on
-            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-            if(machine_info.s_state == S0) continue;
-            int rank = rankMachineForNewVM(machine_id, task_id, false);
-            if(rank < best_rank){
-                best_rank = rank;
-                best_machine = machine_id;
-            }
-        }
-
-        return best_machine;
-    }
-
-    void storeTaskInMachineWaiting(TaskId_t task_id, MachineId_t machine_id){
-        tasks_waiting_for_machine[machine_id].push_back(task_id);
-        if(!machines_waking.count(machine_id)){
-            machines_waking.insert(machine_id);
-            Machine_SetState(machine_id, S0);
-            SimOutput("storeTaskInMachineWaiting(): waking machine " + to_string(machine_id) +
-                  " for task " + to_string(task_id), 2);
-
-        }
-        
-    }
-
-    bool canMigratingVMFitOnMachine(const VMRecord& vmr, MachineId_t dest){
-        MachineInfo_t dst_mach = Machine_GetInfo(dest);
-        unsigned mem_needed = VM_MEMORY_OVERHEAD + MEM_BUFFER;
-        for (TaskId_t t : vmr.tasks) {
-            mem_needed += GetTaskMemory(t);
-        }
-
-        if (dst_mach.memory_used > dst_mach.memory_size) return false;
-        return (dst_mach.memory_size - dst_mach.memory_used) >= mem_needed;
-
-    }
-
-    bool canVMMigrate(const VMRecord& vmr, MachineId_t dest){
-        MachineInfo_t dst_mach = Machine_GetInfo(dest);
-        if (dst_mach.s_state != S0) return false;
-        if (dst_mach.cpu != vmr.cpu) return false;
-        if (dst_mach.machine_id == vmr.machine_id) return false;
-        if (!canMigratingVMFitOnMachine(vmr, dest)) return false;
-        return true;
-
-    }
-
-    void consolidateVMs(){
-        if (control_migration) return;
-
-        VMId_t best_vm = NO_VALID_VM;
-        MachineId_t best_dst = NO_VALID_MACHINE;
-
-        for (auto& kv : map_vm_records) {
-            VMRecord& vmr = kv.second;
-            if (vmr.tasks.empty()) continue;
-            if (vmr.migrating) continue;
-
-            MachineInfo_t src = Machine_GetInfo(vmr.machine_id);
-
-            if (src.active_tasks > 1) continue;
-            if (src.active_vms != 1) continue;
-            if (checkVMForSLAs(vmr)) continue;
-
-            for (unsigned i = 0; i < Machine_GetTotal(); i++) {
-                MachineId_t dst_machine = static_cast<MachineId_t>(i);
-                if (!canVMMigrate(vmr, dst_machine)) continue;
-
-                MachineInfo_t dst = Machine_GetInfo(dst_machine);
-
-                if (dst.active_tasks == 0) continue;
-
-                if (checkVMForGPUTasks(vmr) && !dst.gpus) continue;
-
-                best_vm = vmr.vm_id;
-                best_dst = dst_machine;
-                break;
-            }
-
-            if (best_vm != NO_VALID_VM) break;
-        }
-
-        if (best_vm != NO_VALID_VM && best_dst != NO_VALID_MACHINE) {
-            map_vm_records[best_vm].migrating = true;
-            control_migration = true;
-            SimOutput("consolidateVMs(): migrating VM " + to_string(best_vm) +
-                    " to machine " + to_string(best_dst), 2);
-            VM_Migrate(best_vm, best_dst);
-        }
-
-    }
-
-
-    void decideMachinePerformance(MachineId_t machine_id) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-
-        if (machine_info.s_state != S0 || machine_info.active_tasks == 0) {
-            return;
-        }
-
-        bool needs_p0= false;
-        for (auto& kv : map_vm_records) {
-            const VMRecord& vmr = kv.second;
-            if (vmr.machine_id != machine_id) 
-                continue;
-            if (checkVMForSLAs(vmr)) {
-                needs_p0 = true;
-                break;
-            }
-        }
-
-        if (needs_p0 || machine_info.active_tasks >= machine_info.num_cpus) {
-            setPStateOfAllCoresOnMachine(machine_id, P0);
-        } else if (machine_info.active_tasks > 0) {
-            setPStateOfAllCoresOnMachine(machine_id, P1);
-        }
-    }
-
-    void removeFinishedTaskFromMap(TaskId_t task_id) {
-        auto iter = map_task_to_vm.find(task_id);
-        if (iter == map_task_to_vm.end()) return;
-
-        VMId_t vm_id = iter->second;
-        auto vm_iterator = map_vm_records.find(vm_id);
-        if (vm_iterator != map_vm_records.end()) {
-            vm_iterator->second.tasks.erase(task_id);
-        }
-        map_task_to_vm.erase(iter);
-    }
-
-    void shutdownEmptyVM(VMId_t vm_id) {
-        auto iter = map_vm_records.find(vm_id);
-        if (iter == map_vm_records.end()) 
-            return;
-        if (iter->second.migrating) 
-            return;
-        if (!iter->second.tasks.empty()) 
-            return;
-        VM_Shutdown(vm_id);
-        MachineId_t machine_id = iter->second.machine_id;
-        map_vm_records.erase(iter);
-        idle_checks_map[machine_id] = 0;
-    }
-
-    void lowerIdleMachineState(MachineId_t machine_id) {
-        if (machines_waking.count(machine_id)) 
-            return;
-
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-
-        if (machine_info.active_vms > 0 || machine_info.active_tasks > 0) {
-            idle_checks_map[machine_id] = 0;
-            return;
-        }
-
-        unsigned idle_num = ++idle_checks_map[machine_id];
-
-        if (idle_num >= IDLE_TO_S5_CHECKS && machine_info.s_state != S5) {
-            Machine_SetState(machine_id, S5);
-        } else if (idle_num >= IDLE_TO_S3_CHECKS && machine_info.s_state != S3 && machine_info.s_state != S4 && machine_info.s_state != S5) {
-            Machine_SetState(machine_id, S3);
-        } else if (idle_num >= IDLE_TO_S1_CHECKS && machine_info.s_state == S0i1) {
-            Machine_SetState(machine_id, S1);
-        } else if (idle_num >= IDLE_TO_S0I1_CHECKS && machine_info.s_state == S0) {
-            Machine_SetState(machine_id, S0i1);
-        }
-
-    }
-
 }
 
+Priority_t findPriority(SLAType_t sla) {
+    switch (sla) {
+        case SLA0: return HIGH_PRIORITY;
+        case SLA1: return HIGH_PRIORITY;
+        case SLA2: return MID_PRIORITY;
+        case SLA3: default: return LOW_PRIORITY;
+    }
+}
 
+bool isStrictSLA(SLAType_t sla) {
+    return (sla == SLA0 || sla == SLA1);
+}
+
+bool isMachineReadyNow(MachineId_t machine_id) {
+    if (machines_waking.count(machine_id)) return false;
+    if (machines_sleeping.count(machine_id)) return false;
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    return info.s_state == S0;
+}
+
+bool machineMatchesTaskBasic(MachineId_t machine_id, TaskId_t task_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.cpu != RequiredCPUType(task_id)) return false;
+    if (IsTaskGPUCapable(task_id) && !info.gpus && ACTIVE_ALGO == GPU_FIRST) return false;
+    return true;
+}
+
+unsigned memoryNeededForTask(TaskId_t task_id, bool creating_new_vm) {
+    unsigned need = GetTaskMemory(task_id) + MEM_BUFFER;
+    if (creating_new_vm) need += VM_MEMORY_OVERHEAD;
+    return need;
+}
+
+bool machineHasEnoughMemory(MachineId_t machine_id, TaskId_t task_id, bool creating_new_vm) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.memory_used > info.memory_size) return false;
+    unsigned free_mem = info.memory_size - info.memory_used;
+    return free_mem >= memoryNeededForTask(task_id, creating_new_vm);
+}
+
+bool vmCanTakeTask(const VMRecord& vmr, TaskId_t task_id) {
+    if (vmr.migrating) return false;
+    if (vmr.vm_id == NO_VALID_VM) return false;
+    if (vmr.machine_id == NO_VALID_MACHINE) return false;
+    if (vmr.cpu != RequiredCPUType(task_id)) return false;
+    if (vmr.vm_type != RequiredVMType(task_id)) return false;
+    if (!isMachineReadyNow(vmr.machine_id)) return false;
+    return machineHasEnoughMemory(vmr.machine_id, task_id, false);
+}
+
+bool vmHasStrictTasks(const VMRecord& vmr) {
+    for (TaskId_t t : vmr.tasks) {
+        if (isStrictSLA(RequiredSLA(t))) return true;
+    }
+    return false;
+}
+
+bool vmHasGpuTasks(const VMRecord& vmr) {
+    for (TaskId_t t : vmr.tasks) {
+        if (IsTaskGPUCapable(t)) return true;
+    }
+    return false;
+}
+
+void setPStateOfAllCoresOnMachine(MachineId_t machine_id, CPUPerformance_t pstate) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    for (unsigned core = 0; core < info.num_cpus; core++) {
+        Machine_SetCorePerformance(machine_id, core, pstate);
+    }
+}
+
+double machineUtilizationEstimate(MachineId_t machine_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.num_cpus == 0) return 0.0;
+    return static_cast<double>(info.active_tasks) / static_cast<double>(info.num_cpus);
+}
+
+int sleepDepthRank(MachineState_t s) {
+    switch (s) {
+        case S0: return 0;
+        case S0i1: return 1;
+        case S1: return 2;
+        case S2: return 3;
+        case S3: return 4;
+        case S4: return 5;
+        case S5: return 6;
+        default: return 10;
+    }
+}
+
+int scoreExistingVM(const VMRecord& vmr, TaskId_t task_id) {
+    MachineInfo_t m = Machine_GetInfo(vmr.machine_id);
+    int score = 0;
+
+    score += static_cast<int>(m.active_tasks) * 20;
+    score -= static_cast<int>(m.active_vms) * 5;
+
+    unsigned free_mem = (m.memory_size >= m.memory_used) ? (m.memory_size - m.memory_used) : 0;
+    if (free_mem >= GetTaskMemory(task_id)) {
+        score += static_cast<int>((free_mem - GetTaskMemory(task_id)) / 32);
+    }
+
+    if (ACTIVE_ALGO == SLA_AWARE) {
+        SLAType_t sla = RequiredSLA(task_id);
+        if (isStrictSLA(sla)) {
+            score += static_cast<int>(m.active_tasks) * 40;
+            if (vmHasStrictTasks(vmr)) score += 35;
+        } else {
+            score -= 10;
+        }
+    }
+
+    if (ACTIVE_ALGO == GPU_FIRST) {
+        if (IsTaskGPUCapable(task_id)) {
+            if (m.gpus) score -= 40;
+            else score += 1000;
+        } else {
+            if (m.gpus) score += 50;
+        }
+    }
+
+    if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) {
+        double util = machineUtilizationEstimate(vmr.machine_id);
+        if (util < CONSOLIDATE_LOW_UTIL) score -= 15;
+        if (util > CONSOLIDATE_HIGH_UTIL) score += 35;
+    }
+
+    return score;
+}
+
+VMId_t findBestExistingVM(TaskId_t task_id) {
+    VMId_t best = NO_VALID_VM;
+    int best_score = numeric_limits<int>::max();
+
+    for (auto& kv : map_vm_records) {
+        const VMRecord& vmr = kv.second;
+        if (!vmCanTakeTask(vmr, task_id)) continue;
+
+        int score = scoreExistingVM(vmr, task_id);
+        if (score < best_score) {
+            best_score = score;
+            best = vmr.vm_id;
+        }
+    }
+    return best;
+}
+
+int scoreNewMachine(MachineId_t machine_id, TaskId_t task_id, bool ready_only) {
+    MachineInfo_t m = Machine_GetInfo(machine_id);
+
+    if (!machineMatchesTaskBasic(machine_id, task_id)) return numeric_limits<int>::max();
+    if (ready_only && !isMachineReadyNow(machine_id)) return numeric_limits<int>::max();
+    if (!machineHasEnoughMemory(machine_id, task_id, true)) return numeric_limits<int>::max();
+
+    int score = 0;
+
+    score += static_cast<int>(m.active_tasks) * 20;
+    score += static_cast<int>(m.active_vms) * 10;
+
+    if (!ready_only && m.s_state != S0) {
+        score += 120 + 40 * sleepDepthRank(m.s_state);
+    }
+
+    switch (ACTIVE_ALGO) {
+        case GREEDY_BEST_FIT: {
+            unsigned free_mem = (m.memory_size >= m.memory_used) ? (m.memory_size - m.memory_used) : 0;
+            if (free_mem >= memoryNeededForTask(task_id, true)) {
+                score += static_cast<int>((free_mem - memoryNeededForTask(task_id, true)) / 16);
+            }
+            break;
+        }
+        case SLA_AWARE: {
+            SLAType_t sla = RequiredSLA(task_id);
+            if (isStrictSLA(sla)) {
+                if (m.s_state != S0) score += 200;
+                if (m.active_tasks == 0) score -= 30;
+                if (m.p_state != P0) score += 10;
+            } else {
+                score -= 5;
+            }
+            break;
+        }
+        case GPU_FIRST: {
+            if (IsTaskGPUCapable(task_id)) {
+                if (m.gpus) score -= 60;
+                else score += 1000;
+            } else {
+                if (m.gpus) score += 60;
+            }
+            break;
+        }
+        case THRESHOLD_CONSOLIDATION: {
+            double util = machineUtilizationEstimate(machine_id);
+            if (util < CONSOLIDATE_LOW_UTIL) score -= 25;
+            if (util > CONSOLIDATE_HIGH_UTIL) score += 40;
+            break;
+        }
+    }
+
+    return score;
+}
+
+MachineId_t findBestMachineForNewVM(TaskId_t task_id, bool ready_only) {
+    MachineId_t best = NO_VALID_MACHINE;
+    int best_score = numeric_limits<int>::max();
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        int score = scoreNewMachine(mid, task_id, ready_only);
+        if (score < best_score) {
+            best_score = score;
+            best = mid;
+        }
+    }
+    return best;
+}
+
+bool tryPlaceTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
+    auto it = map_vm_records.find(vm_id);
+    if (it == map_vm_records.end()) return false;
+
+    VMRecord& vmr = it->second;
+    if (!vmCanTakeTask(vmr, task_id)) return false;
+
+    Priority_t pr = findPriority(RequiredSLA(task_id));
+    SetTaskPriority(task_id, pr);
+    VM_AddTask(vm_id, task_id, pr);
+
+    vmr.tasks.insert(task_id);
+    map_task_to_vm[task_id] = vm_id;
+    idle_checks_map[vmr.machine_id] = 0;
+
+    if (ACTIVE_ALGO == SLA_AWARE && isStrictSLA(RequiredSLA(task_id))) {
+        setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
+    }
+
+    return true;
+}
+
+bool createAttachAndPlace(TaskId_t task_id, MachineId_t machine_id) {
+    if (!isMachineReadyNow(machine_id)) return false;
+    if (!machineMatchesTaskBasic(machine_id, task_id)) return false;
+    if (!machineHasEnoughMemory(machine_id, task_id, true)) return false;
+
+    VMType_t vm_type = RequiredVMType(task_id);
+    CPUType_t cpu = RequiredCPUType(task_id);
+
+    if (!isMachineReadyNow(machine_id)) return false;
+
+    VMId_t vm_id = VM_Create(vm_type, cpu);
+
+    if (!isMachineReadyNow(machine_id)) {
+        return false;
+    }
+
+    VM_Attach(vm_id, machine_id);
+
+    VMRecord rec;
+    rec.vm_id = vm_id;
+    rec.vm_type = vm_type;
+    rec.cpu = cpu;
+    rec.machine_id = machine_id;
+    rec.migrating = false;
+
+    map_vm_records[vm_id] = rec;
+    return tryPlaceTaskOnVM(vm_id, task_id);
+}
+
+void queueTaskForMachine(TaskId_t task_id, MachineId_t machine_id) {
+    tasks_waiting_for_machine[machine_id].push_back(task_id);
+    idle_checks_map[machine_id] = 0;
+
+    if (!machines_waking.count(machine_id)) {
+        machines_sleeping.erase(machine_id);
+        machines_waking.insert(machine_id);
+        Machine_SetState(machine_id, S0);
+        SimOutput("queueTaskForMachine(): waking machine " + to_string(machine_id) +
+                  " for task " + to_string(task_id), 2);
+    }
+}
+
+MachineId_t findCompatibleWakingMachine(TaskId_t task_id) {
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        if (!machines_waking.count(mid)) continue;
+        if (!machineMatchesTaskBasic(mid, task_id)) continue;
+        if (!machineHasEnoughMemory(mid, task_id, true)) continue;
+        return mid;
+    }
+    return NO_VALID_MACHINE;
+}
+
+bool tryScheduleTaskNow(TaskId_t task_id) {
+    VMId_t existing = findBestExistingVM(task_id);
+    if (existing != NO_VALID_VM) {
+        return tryPlaceTaskOnVM(existing, task_id);
+    }
+
+    MachineId_t ready_machine = findBestMachineForNewVM(task_id, true);
+    if (ready_machine != NO_VALID_MACHINE) {
+        if (createAttachAndPlace(task_id, ready_machine)) return true;
+    }
+
+    return false;
+}
+
+bool anyCompatibleMachineExists(TaskId_t task_id) {
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        if (machineMatchesTaskBasic(mid, task_id)) return true;
+    }
+    return false;
+}
+
+void tryDrainMachineQueue(Time_t now, MachineId_t machine_id) {
+    if (!isMachineReadyNow(machine_id)) return;
+
+    auto it = tasks_waiting_for_machine.find(machine_id);
+    if (it == tasks_waiting_for_machine.end()) return;
+
+    auto& q = it->second;
+    while (!q.empty()) {
+        TaskId_t task_id = q.front();
+
+        if (tryScheduleTaskNow(task_id)) {
+            q.pop_front();
+            continue;
+        }
+
+        if (createAttachAndPlace(task_id, machine_id)) {
+            q.pop_front();
+            continue;
+        }
+
+        break;
+    }
+
+    if (q.empty()) tasks_waiting_for_machine.erase(machine_id);
+}
+
+void tryDrainGlobalQueue(Time_t now) {
+    size_t attempts = global_waiting_tasks.size();
+    while (attempts-- > 0 && !global_waiting_tasks.empty()) {
+        TaskId_t task_id = global_waiting_tasks.front();
+        global_waiting_tasks.pop_front();
+
+        if (tryScheduleTaskNow(task_id)) continue;
+
+        MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
+        if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
+            queueTaskForMachine(task_id, sleeping);
+            continue;
+        }
+
+        global_waiting_tasks.push_back(task_id);
+    }
+}
+
+void removeFinishedTaskFromMaps(TaskId_t task_id) {
+    auto it = map_task_to_vm.find(task_id);
+    if (it == map_task_to_vm.end()) return;
+
+    VMId_t vm_id = it->second;
+    auto vm_it = map_vm_records.find(vm_id);
+    if (vm_it != map_vm_records.end()) {
+        vm_it->second.tasks.erase(task_id);
+    }
+    map_task_to_vm.erase(it);
+}
+
+unsigned countReadyMachinesByCPU(CPUType_t cpu) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.cpu == cpu && isMachineReadyNow(mid)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void shutdownEmptyVM(VMId_t vm_id) {
+    auto it = map_vm_records.find(vm_id);
+    if (it == map_vm_records.end()) return;
+    if (it->second.migrating) return;
+    if (!it->second.tasks.empty()) return;
+
+    MachineId_t machine_id = it->second.machine_id;
+    VM_Shutdown(vm_id);
+    map_vm_records.erase(it);
+    idle_checks_map[machine_id] = 0;
+}
+
+void decideMachinePerformance(MachineId_t machine_id) {
+    MachineInfo_t m = Machine_GetInfo(machine_id);
+    if (m.s_state != S0 || m.active_tasks == 0) return;
+
+    bool strict_present = false;
+    for (auto& kv : map_vm_records) {
+        const VMRecord& vmr = kv.second;
+        if (vmr.machine_id != machine_id) continue;
+        if (vmHasStrictTasks(vmr)) {
+            strict_present = true;
+            break;
+        }
+    }
+
+    switch (ACTIVE_ALGO) {
+        case GREEDY_BEST_FIT:
+            if (m.active_tasks >= m.num_cpus) setPStateOfAllCoresOnMachine(machine_id, P0);
+            else setPStateOfAllCoresOnMachine(machine_id, P1);
+            break;
+
+        case SLA_AWARE:
+            if (strict_present || m.active_tasks >= m.num_cpus) setPStateOfAllCoresOnMachine(machine_id, P0);
+            else if (m.active_tasks > 0) setPStateOfAllCoresOnMachine(machine_id, P1);
+            break;
+
+        case GPU_FIRST:
+            if (m.gpus && m.active_tasks > 0) setPStateOfAllCoresOnMachine(machine_id, P0);
+            else if (m.active_tasks >= m.num_cpus) setPStateOfAllCoresOnMachine(machine_id, P0);
+            else setPStateOfAllCoresOnMachine(machine_id, P1);
+            break;
+
+        case THRESHOLD_CONSOLIDATION: {
+            double util = machineUtilizationEstimate(machine_id);
+            if (strict_present || util >= 0.80) setPStateOfAllCoresOnMachine(machine_id, P0);
+            else if (util >= 0.40) setPStateOfAllCoresOnMachine(machine_id, P1);
+            else setPStateOfAllCoresOnMachine(machine_id, P2);
+            break;
+        }
+    }
+}
+
+void lowerIdleMachineState(MachineId_t machine_id) {
+    if (machines_waking.count(machine_id)) return;
+    if (machines_sleeping.count(machine_id)) return;
+
+    MachineInfo_t m = Machine_GetInfo(machine_id);
+    if (m.cpu == X86 && countReadyMachinesByCPU(X86) <= 2) {
+        return;
+    }
+
+    if (m.active_vms > 0 || m.active_tasks > 0) {
+        idle_checks_map[machine_id] = 0;
+        return;
+    }
+
+    unsigned idle_num = ++idle_checks_map[machine_id];
+
+    MachineState_t target = m.s_state;
+    switch (ACTIVE_ALGO) {
+        case GREEDY_BEST_FIT:
+        case GPU_FIRST:
+            if (idle_num >= IDLE_TO_S5_CHECKS && m.s_state != S5) target = S5;
+            else if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
+            else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
+            else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            break;
+
+        case SLA_AWARE:
+            if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
+            else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
+            else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            break;
+
+        case THRESHOLD_CONSOLIDATION:
+            if (idle_num >= IDLE_TO_S5_CHECKS && m.s_state != S5) target = S5;
+            else if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
+            else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
+            else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            break;
+    }
+
+    if (target != m.s_state) {
+        machines_waking.erase(machine_id);
+        machines_sleeping.insert(machine_id);
+        Machine_SetState(machine_id, target);
+    }
+}
+
+bool canMigrateVMToMachine(const VMRecord& vmr, MachineId_t dst_machine) {
+    if (vmr.migrating) return false;
+    if (!isMachineReadyNow(dst_machine)) return false;
+
+    MachineInfo_t dst = Machine_GetInfo(dst_machine);
+    if (dst.machine_id == vmr.machine_id) return false;
+    if (dst.cpu != vmr.cpu) return false;
+
+    unsigned need = VM_MEMORY_OVERHEAD + MEM_BUFFER;
+    for (TaskId_t t : vmr.tasks) need += GetTaskMemory(t);
+
+    if (dst.memory_used > dst.memory_size) return false;
+    return (dst.memory_size - dst.memory_used) >= need;
+}
+
+void tryConsolidateVMs() {
+    if (ACTIVE_ALGO != THRESHOLD_CONSOLIDATION) return;
+    if (control_migration) return;
+
+    VMId_t chosen_vm = NO_VALID_VM;
+    MachineId_t chosen_dst = NO_VALID_MACHINE;
+
+    for (auto& kv : map_vm_records) {
+        VMRecord& vmr = kv.second;
+        if (vmr.tasks.empty()) continue;
+        if (vmr.migrating) continue;
+        if (vmHasStrictTasks(vmr)) continue;
+
+        MachineInfo_t src = Machine_GetInfo(vmr.machine_id);
+        if (src.s_state != S0) continue;
+
+        double util = machineUtilizationEstimate(vmr.machine_id);
+        if (util > CONSOLIDATE_LOW_UTIL) continue;
+
+        for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+            MachineId_t dst = static_cast<MachineId_t>(i);
+            if (!canMigrateVMToMachine(vmr, dst)) continue;
+
+            MachineInfo_t dst_info = Machine_GetInfo(dst);
+            double dst_util = machineUtilizationEstimate(dst);
+            if (dst_info.active_tasks == 0) continue;
+            if (dst_util >= CONSOLIDATE_HIGH_UTIL) continue;
+            if (vmHasGpuTasks(vmr) && !dst_info.gpus) continue;
+
+            chosen_vm = vmr.vm_id;
+            chosen_dst = dst;
+            break;
+        }
+
+        if (chosen_vm != NO_VALID_VM) break;
+    }
+
+    if (chosen_vm != NO_VALID_VM && chosen_dst != NO_VALID_MACHINE) {
+        map_vm_records[chosen_vm].migrating = true;
+        control_migration = true;
+        VM_Migrate(chosen_vm, chosen_dst);
+        SimOutput("tryConsolidateVMs(): migrating VM " + to_string(chosen_vm) +
+                  " to machine " + to_string(chosen_dst), 2);
+    }
+}
+
+} // namespace
 
 void Scheduler::Init() {
-    // Find the parameters of the clusters
-    // Get the total number of machines
-    // For each machine:
-    //      Get the type of the machine
-    //      Get the memory of the machine
-    //      Get the number of CPUs
-    //      Get if there is a GPU or not
-    // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
-    SimOutput("Scheduler::Init(): no startup VMs, creating on-demand", 1);
+    SimOutput("Scheduler::Init(): algorithm = " + algoName(), 1);
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 2);
 
     machines.clear();
     vms.clear();
-    // looping through machines to set ID to index 
-    for(unsigned i = 0; i < Machine_GetTotal(); i++) {
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
         MachineId_t machine_id = static_cast<MachineId_t>(i);
         machines.push_back(machine_id);
         idle_checks_map[machine_id] = 0;
 
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if (machine_info.s_state == S0) {
-            setPStateOfAllCoresOnMachine(machine_id, P1);
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        if (info.s_state == S0) {
+            if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) setPStateOfAllCoresOnMachine(machine_id, P2);
+            else setPStateOfAllCoresOnMachine(machine_id, P1);
         }
     }
-
-   
 }
+
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-     auto iter = map_vm_records.find(vm_id);
-     if (iter != map_vm_records.end()) {
-        iter->second.migrating = false;
-        VMInfo_t machine_info = VM_GetInfo(vm_id);
-        iter->second.machine_id = machine_info.machine_id;
+    auto it = map_vm_records.find(vm_id);
+    if (it != map_vm_records.end()) {
+        it->second.migrating = false;
+        VMInfo_t info = VM_GetInfo(vm_id);
+        it->second.machine_id = info.machine_id;
+        idle_checks_map[info.machine_id] = 0;
     }
 
     control_migration = false;
-
-    // Update your data structure. The VM now can receive new tasks
     SimOutput("Scheduler::MigrationComplete(): VM " + to_string(vm_id) +
               " completed migration at time " + to_string(time), 2);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-
     SimOutput("Scheduler::NewTask(): task " + to_string(task_id) +
               " arrived at " + to_string(now), 3);
-    if (trySchedulingTaskImmediately(task_id)) {
-        return;
-    }
-    MachineId_t sleeping_machine = chooseMachineToWakeUp(task_id);
-    if (sleeping_machine != NO_VALID_MACHINE) {
-        storeTaskInMachineWaiting(task_id, sleeping_machine);
-        return;
-    }
 
-    for (auto& kv : map_vm_records) {
-        const VMRecord& vmr = kv.second;
-        if (vmr.migrating) continue;
-        if (vmr.vm_type != RequiredVMType(task_id)) continue;
-        if (vmr.cpu != RequiredCPUType(task_id)) continue;
-        if (!checkMachineReady(vmr.machine_id)) continue;
+    if (tryScheduleTaskNow(task_id)) return;
 
-        tryPlacingTaskOnVM(vmr.vm_id, task_id);
-        SimOutput("Scheduler::NewTask(): used last-resort placement for task " +
-                  to_string(task_id), 1);
+    MachineId_t sleeping_candidate = findBestMachineForNewVM(task_id, false);
+    if (sleeping_candidate != NO_VALID_MACHINE && !isMachineReadyNow(sleeping_candidate)) {
+        queueTaskForMachine(task_id, sleeping_candidate);
         return;
     }
 
-    ThrowException("Scheduler::NewTask(): no valid placement found for task ", task_id);
+    MachineId_t waking_machine = findCompatibleWakingMachine(task_id);
+    if (waking_machine != NO_VALID_MACHINE) {
+        tasks_waiting_for_machine[waking_machine].push_back(task_id);
+        return;
+    }
+
+    if (anyCompatibleMachineExists(task_id)) {
+        global_waiting_tasks.push_back(task_id);
+        SimOutput("Scheduler::NewTask(): global queue fallback for task " + to_string(task_id), 2);
+        return;
+    }
+
+    ThrowException("Scheduler::NewTask(): no compatible machine type exists for task ", task_id);
 }
-   
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     SimOutput("Scheduler::PeriodicCheck(): time " + to_string(now), 4);
+
     for (unsigned i = 0; i < Machine_GetTotal(); i++) {
         MachineId_t machine_id = static_cast<MachineId_t>(i);
         decideMachinePerformance(machine_id);
         lowerIdleMachineState(machine_id);
     }
 
-    consolidateVMs();
-
+    tryConsolidateVMs();
+    tryDrainGlobalQueue(now);
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    // Do your final reporting and bookkeeping here.
-    // Report about the total energy consumed
-    // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
-    vector<VMId_t> vm_ids;
-    vm_ids.reserve(map_vm_records.size());
-    for (auto& kv : map_vm_records) {
-        vm_ids.push_back(kv.first);
+    vector<VMId_t> ids;
+    ids.reserve(map_vm_records.size());
+    for (auto& kv : map_vm_records) ids.push_back(kv.first);
+
+    for (VMId_t vm_id : ids) {
+        try { VM_Shutdown(vm_id); } catch (...) {}
     }
 
-    for (VMId_t vm_id : vm_ids) {
-        try {
-            VM_Shutdown(vm_id);
-        } catch (...) {
-        }
-    }
-
-    SimOutput("SimulationComplete(): Finished!", 4);
-    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
+    SimOutput("SimulationComplete(): Finished with algorithm " + algoName(), 1);
+    SimOutput("SimulationComplete(): Time is " + to_string(time), 3);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
+              " complete at " + to_string(now), 4);
 
-    auto iter = map_task_to_vm.find(task_id);
-    if (iter == map_task_to_vm.end()) {
-        return;
-    }
+    auto it = map_task_to_vm.find(task_id);
+    if (it == map_task_to_vm.end()) return;
 
-    VMId_t vm_id = iter->second;
+    VMId_t vm_id = it->second;
+    try { VM_RemoveTask(vm_id, task_id); } catch (...) {}
 
-    try {
-        VM_RemoveTask(vm_id, task_id);
-    } catch (...) {
-    }
-
-    removeFinishedTaskFromMap(task_id);
+    removeFinishedTaskFromMaps(task_id);
     shutdownEmptyVM(vm_id);
 
+    auto vm_it = map_vm_records.find(vm_id);
+    if (vm_it != map_vm_records.end()) {
+        idle_checks_map[vm_it->second.machine_id] = 0;
+    }
+
+    tryDrainGlobalQueue(now);
 }
 
-// Public interface below
 
 static Scheduler SchedulerInstance;
 
@@ -630,21 +732,23 @@ void InitScheduler() {
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
+    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) +
+              " at time " + to_string(time), 4);
     SchedulerInstance.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
+    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) +
+              " completed at time " + to_string(time), 4);
     SchedulerInstance.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // The simulator is alerting you that machine identified by machine_id is overcommitted
-    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) +
+              " detected at time " + to_string(time), 0);
 
-    if (machine_info.s_state == S0) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.s_state == S0) {
         setPStateOfAllCoresOnMachine(machine_id, P0);
     }
 
@@ -653,12 +757,14 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
         if (candidate == machine_id) continue;
 
         MachineInfo_t cinfo = Machine_GetInfo(candidate);
-        if (cinfo.cpu != machine_info.cpu) continue;
-        if (cinfo.s_state == S0) continue;
+        if (cinfo.cpu != info.cpu) continue;
         if (machines_waking.count(candidate)) continue;
+        if (cinfo.s_state == S0) continue;
 
+        machines_sleeping.erase(candidate);
         machines_waking.insert(candidate);
         Machine_SetState(candidate, S0);
+
         SimOutput("MemoryWarning(): proactively waking machine " +
                   to_string(candidate), 2);
         break;
@@ -666,93 +772,96 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
+    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) +
+              " completed at time " + to_string(time), 4);
     SchedulerInstance.MigrationComplete(time, vm_id);
 }
 
 void SchedulerCheck(Time_t time) {
-    // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
+    SimOutput("SchedulerCheck(): called at " + to_string(time), 4);
     SchedulerInstance.PeriodicCheck(time);
-
 }
 
 void SimulationComplete(Time_t time) {
-    // This function is called before the simulation terminates Add whatever you feel like.
+    cout << "Algorithm: " << algoName() << endl;
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
-    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
+    cout << "Simulation run finished in " << double(time) / 1000000 << " seconds" << endl;
+
     SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
     SchedulerInstance.Shutdown(time);
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    SimOutput("SLAWarning(): the task " + to_string(task_id) +
-    " warned at time: " + to_string(time), 1);
+    SimOutput("SLAWarning(): task " + to_string(task_id) +
+              " warned at time " + to_string(time), 1);
+
     SetTaskPriority(task_id, HIGH_PRIORITY);
-    auto iter = map_task_to_vm.find(task_id);
-    if (iter != map_task_to_vm.end()) {
-        VMId_t vm_id = iter->second;
+
+    auto it = map_task_to_vm.find(task_id);
+    if (it != map_task_to_vm.end()) {
+        VMId_t vm_id = it->second;
         auto vm_it = map_vm_records.find(vm_id);
         if (vm_it != map_vm_records.end()) {
             MachineId_t machine_id = vm_it->second.machine_id;
             if (machine_id != NO_VALID_MACHINE) {
-                MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-                if (machine_info.s_state == S0) {
+                MachineInfo_t info = Machine_GetInfo(machine_id);
+                if (info.s_state == S0 && !machines_waking.count(machine_id) && !machines_sleeping.count(machine_id)) {
                     setPStateOfAllCoresOnMachine(machine_id, P0);
+                } else if (!machines_waking.count(machine_id)) {
+                    machines_sleeping.erase(machine_id);
+                    machines_waking.insert(machine_id);
+                    Machine_SetState(machine_id, S0);
                 }
             }
         }
     }
 
     CPUType_t cpu = RequiredCPUType(task_id);
+    unsigned woken = 0;
+
     for (unsigned i = 0; i < Machine_GetTotal(); i++) {
         MachineId_t machine_id = static_cast<MachineId_t>(i);
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        MachineInfo_t info = Machine_GetInfo(machine_id);
 
-        if (machine_info.cpu != cpu) continue;
-        if (machine_info.s_state == S0) continue;
+        if (info.cpu != cpu) continue;
         if (machines_waking.count(machine_id)) continue;
+        if (info.s_state == S0) continue;
 
+        machines_sleeping.erase(machine_id);
         machines_waking.insert(machine_id);
         Machine_SetState(machine_id, S0);
+
         SimOutput("SLAWarning(): waking machine " + to_string(machine_id) +
-                  " for SLA protection", 2);
-        break;
+                " for SLA protection", 2);
+
+        woken++;
+
+        if (isStrictSLA(RequiredSLA(task_id))) {
+            if (woken >= 2) break;   // wake 2 machines for SLA0/SLA1
+        } else {
+            if (woken >= 1) break;   // keep old behavior for others
+        }
     }
-
-
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
-    SimOutput("StateChangeComplete(): the machine " + to_string(machine_id) +
-    " changed state at time: " + to_string(time), 3);
+    SimOutput("StateChangeComplete(): machine " + to_string(machine_id) +
+              " changed state at time " + to_string(time), 3);
+
+    MachineInfo_t info = Machine_GetInfo(machine_id);
 
     machines_waking.erase(machine_id);
     idle_checks_map[machine_id] = 0;
 
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-    if (machine_info.s_state != S0) {
-        return;
+    if (info.s_state == S0) {
+        machines_sleeping.erase(machine_id);
+        tryDrainMachineQueue(time, machine_id);
+        tryDrainGlobalQueue(time);
+    } else {
+        machines_sleeping.insert(machine_id);
     }
-
-    auto wait_iter = tasks_waiting_for_machine.find(machine_id);
-    if (wait_iter == tasks_waiting_for_machine.end()) {
-        return;
-    }
-
-    vector<TaskId_t> tasks_waiting = wait_iter->second;
-    tasks_waiting_for_machine.erase(wait_iter);
-
-    for (TaskId_t task_id : tasks_waiting) {
-        SchedulerInstance.NewTask(time, task_id);
-    }
-
 }
-

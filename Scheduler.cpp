@@ -4,14 +4,6 @@
 //
 //  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
 //
-//  SLA0 fixes applied:
-//  1. Priority global queue (SLA0 drained first)
-//  2. Aggressive sleep suppression for X86 machines
-//  3. SLA0 tasks never share VMs with non-SLA0 tasks (SLA_AWARE)
-//  4. Proactive P0 on SLA0 task placement
-//  5. SLA0 tasks bypass global queue and wake machines immediately
-//  6. scoreExistingVM penalizes mixed-SLA VMs heavily for SLA0 tasks
-//
 
 #include "Scheduler.hpp"
 #include <vector>

@@ -1,4 +1,4 @@
-//
+// 
 //  Scheduler.cpp
 //  CloudSim
 //
@@ -97,13 +97,6 @@ bool isMachineReadyNow(MachineId_t machine_id) {
     return info.s_state == S0;
 }
 
-bool machineMatchesTaskBasic(MachineId_t machine_id, TaskId_t task_id) {
-    MachineInfo_t info = Machine_GetInfo(machine_id);
-    if (info.cpu != RequiredCPUType(task_id)) return false;
-    if (IsTaskGPUCapable(task_id) && !info.gpus && ACTIVE_ALGO == GPU_FIRST) return false;
-    return true;
-}
-
 unsigned memoryNeededForTask(TaskId_t task_id, bool creating_new_vm) {
     unsigned need = GetTaskMemory(task_id) + MEM_BUFFER;
     if (creating_new_vm) need += VM_MEMORY_OVERHEAD;
@@ -196,6 +189,95 @@ int machineSpeedBonus(const MachineInfo_t& m) {
     return bonus;
 }
 
+uint64_t p0Mips(MachineId_t machine_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.performance.empty()) return 0;
+    return static_cast<uint64_t>(info.performance[0]);
+}
+
+unsigned bestCompatibleP0(TaskId_t task_id) {
+    unsigned best = 0;
+    CPUType_t cpu = RequiredCPUType(task_id);
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.cpu != cpu) continue;
+        if (info.performance.empty()) continue;
+        best = max(best, info.performance[0]);
+    }
+    return best;
+}
+
+unsigned bestCompatibleCores(TaskId_t task_id) {
+    unsigned best = 0;
+    CPUType_t cpu = RequiredCPUType(task_id);
+
+    for (unsigned i = 0; i < Machine_GetTotal(); i++) {
+        MachineId_t mid = static_cast<MachineId_t>(i);
+        MachineInfo_t info = Machine_GetInfo(mid);
+        if (info.cpu != cpu) continue;
+        best = max(best, info.num_cpus);
+    }
+    return best;
+}
+
+bool canMeetStrictBestCase(MachineId_t machine_id, TaskId_t task_id) {
+    if (!isStrictSLA(RequiredSLA(task_id))) return true;
+
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+
+    if (machine_info.performance.empty()) return false;
+    uint64_t mips = static_cast<uint64_t>(machine_info.performance[0]);
+    if (mips == 0) return false;
+
+    uint64_t budget_us = 0;
+    if (task_info.target_completion > task_info.arrival) {
+        budget_us = static_cast<uint64_t>(task_info.target_completion - task_info.arrival);
+    }
+    if (budget_us == 0) return false;
+
+    uint64_t best_runtime_us =
+        (static_cast<uint64_t>(task_info.total_instructions) + mips - 1) / mips;
+
+    return best_runtime_us <= budget_us;
+}
+
+bool isCompetitiveStrictMachine(MachineId_t machine_id, TaskId_t task_id) {
+    if (!isStrictSLA(RequiredSLA(task_id))) return true;
+
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.performance.empty()) return false;
+
+    unsigned best_p0 = bestCompatibleP0(task_id);
+    unsigned best_cores = bestCompatibleCores(task_id);
+
+    if (best_p0 == 0 || best_cores == 0) return true;
+
+    unsigned perf_pct = static_cast<unsigned>((100ULL * info.performance[0]) / best_p0);
+    unsigned core_pct = static_cast<unsigned>((100ULL * info.num_cpus) / best_cores);
+
+    if (isSLA0(task_id)) {
+        return perf_pct >= 70 && core_pct >= 75;
+    } else {
+        return perf_pct >= 60 && core_pct >= 50;
+    }
+}
+
+bool machineMatchesTaskBasic(MachineId_t machine_id, TaskId_t task_id) {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    if (info.cpu != RequiredCPUType(task_id)) return false;
+    if (IsTaskGPUCapable(task_id) && !info.gpus && ACTIVE_ALGO == GPU_FIRST) return false;
+
+    if (ACTIVE_ALGO == SLA_AWARE && isStrictSLA(RequiredSLA(task_id))) {
+        if (!canMeetStrictBestCase(machine_id, task_id)) return false;
+        if (!isCompetitiveStrictMachine(machine_id, task_id)) return false;
+    }
+
+    return true;
+}
+
 bool vmCanTakeTask(const VMRecord& vmr, TaskId_t task_id) {
     if (vmr.migrating) return false;
     if (vmr.vm_id == NO_VALID_VM) return false;
@@ -205,6 +287,11 @@ bool vmCanTakeTask(const VMRecord& vmr, TaskId_t task_id) {
     if (!isMachineReadyNow(vmr.machine_id)) return false;
     if (!machineHasEnoughMemory(vmr.machine_id, task_id, false)) return false;
 
+    if (ACTIVE_ALGO == SLA_AWARE && isStrictSLA(RequiredSLA(task_id))) {
+        if (!canMeetStrictBestCase(vmr.machine_id, task_id)) return false;
+        if (!isCompetitiveStrictMachine(vmr.machine_id, task_id)) return false;
+    }
+
     if (ACTIVE_ALGO == SLA_AWARE) {
         SLAType_t sla = RequiredSLA(task_id);
         unsigned count = vmTaskCount(vmr);
@@ -213,7 +300,7 @@ bool vmCanTakeTask(const VMRecord& vmr, TaskId_t task_id) {
             if (count >= 2) return false;
             if (!vmr.tasks.empty() && !vmHasOnlySLA0Tasks(vmr)) return false;
         } else if (sla == SLA1) {
-            if (count >= 4) return false;
+            if (count >= 2) return false;
         } else {
             if (vmHasOnlySLA0Tasks(vmr)) return false;
         }
@@ -238,15 +325,16 @@ int scoreExistingVM(const VMRecord& vmr, TaskId_t task_id) {
         SLAType_t sla = RequiredSLA(task_id);
 
         if (sla == SLA0) {
-            if (!vmHasOnlySLA0Tasks(vmr)) score += 500;
-            score += static_cast<int>(vmTaskCount(vmr)) * 220;
-            score += static_cast<int>(m.active_tasks) * 40;
+            if (!vmHasOnlySLA0Tasks(vmr)) score += 600;
+            score += static_cast<int>(vmTaskCount(vmr)) * 260;
+            score += static_cast<int>(m.active_tasks) * 60;
             score -= machineSpeedBonus(m);
-            if (isFastMachineForStrict(m)) score -= 120;
+            if (isFastMachineForStrict(m)) score -= 140;
         } else if (sla == SLA1) {
-            score += static_cast<int>(vmTaskCount(vmr)) * 90;
-            score += static_cast<int>(m.active_tasks) * 35;
+            score += static_cast<int>(vmTaskCount(vmr)) * 150;
+            score += static_cast<int>(m.active_tasks) * 45;
             score -= machineSpeedBonus(m) / 2;
+            if (m.active_tasks >= m.num_cpus / 2) score += 80;
         } else {
             if (vmHasOnlySLA0Tasks(vmr)) score += 500;
             score -= 10;
@@ -317,19 +405,19 @@ int scoreNewMachine(MachineId_t machine_id, TaskId_t task_id, bool ready_only) {
             SLAType_t sla = RequiredSLA(task_id);
             if (sla == SLA0) {
                 if (m.s_state != S0) score += 600;
-                score += static_cast<int>(m.active_tasks) * 50;
-                score += static_cast<int>(m.active_vms) * 20;
+                score += static_cast<int>(m.active_tasks) * 60;
+                score += static_cast<int>(m.active_vms) * 30;
                 score -= machineSpeedBonus(m);
-                if (isFastMachineForStrict(m)) score -= 140;
-                if (m.active_tasks == 0) score -= 100;
-                if (m.active_tasks >= m.num_cpus) score += 200;
+                if (isFastMachineForStrict(m)) score -= 180;
+                if (m.active_tasks == 0) score -= 140;
+                if (m.active_tasks >= m.num_cpus / 2) score += 160;
                 if (m.p_state != P0) score += 30;
             } else if (sla == SLA1) {
                 if (m.s_state != S0) score += 250;
-                score += static_cast<int>(m.active_tasks) * 30;
+                score += static_cast<int>(m.active_tasks) * 40;
                 score -= machineSpeedBonus(m) / 2;
-                if (m.active_tasks == 0) score -= 40;
-                if (m.active_tasks >= m.num_cpus) score += 120;
+                if (m.active_tasks == 0) score -= 60;
+                if (m.active_tasks >= m.num_cpus / 2) score += 100;
                 if (m.p_state != P0) score += 15;
             } else {
                 if (machineHostsOnlySLA0Work(machine_id) && m.active_tasks > 0) score += 500;
@@ -390,9 +478,7 @@ bool tryPlaceTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
     idle_checks_map[vmr.machine_id] = 0;
 
     if (ACTIVE_ALGO == SLA_AWARE) {
-        if (isSLA0(task_id)) {
-            setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
-        } else if (isStrictSLA(RequiredSLA(task_id))) {
+        if (isStrictSLA(RequiredSLA(task_id))) {
             setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
         }
     }
@@ -513,23 +599,16 @@ void tryDrainGlobalQueue(Time_t now) {
 
         if (tryScheduleTaskNow(task_id)) continue;
 
-        if (isSLA0(task_id)) {
-            MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
-            if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
-                queueTaskForMachine(task_id, sleeping);
-                continue;
-            }
-            MachineId_t waking = findCompatibleWakingMachine(task_id);
-            if (waking != NO_VALID_MACHINE) {
-                tasks_waiting_for_machine[waking].push_back(task_id);
-                continue;
-            }
-        } else {
-            MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
-            if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
-                queueTaskForMachine(task_id, sleeping);
-                continue;
-            }
+        MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
+        if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
+            queueTaskForMachine(task_id, sleeping);
+            continue;
+        }
+
+        MachineId_t waking = findCompatibleWakingMachine(task_id);
+        if (waking != NO_VALID_MACHINE) {
+            tasks_waiting_for_machine[waking].push_back(task_id);
+            continue;
         }
 
         urgent_waiting_tasks.push_back(task_id);
@@ -618,9 +697,7 @@ void decideMachinePerformance(MachineId_t machine_id) {
             break;
 
         case SLA_AWARE:
-            if (sla0_present) {
-                setPStateOfAllCoresOnMachine(machine_id, P0);
-            } else if (strict_present) {
+            if (strict_present) {
                 setPStateOfAllCoresOnMachine(machine_id, P0);
             } else if (m.active_tasks >= m.num_cpus / 2) {
                 setPStateOfAllCoresOnMachine(machine_id, P0);
@@ -652,7 +729,7 @@ void lowerIdleMachineState(MachineId_t machine_id) {
     MachineInfo_t m = Machine_GetInfo(machine_id);
 
     unsigned min_ready_x86 = 2;
-    if (ACTIVE_ALGO == SLA_AWARE)               min_ready_x86 = 13;
+    if (ACTIVE_ALGO == SLA_AWARE)               min_ready_x86 = 16;
     else if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) min_ready_x86 = 4;
     else if (ACTIVE_ALGO == GREEDY_BEST_FIT)    min_ready_x86 = 3;
     else if (ACTIVE_ALGO == GPU_FIRST)          min_ready_x86 = 3;
@@ -976,6 +1053,11 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
             if (machines_waking.count(machine_id)) continue;
             if (info.s_state == S0) continue;
 
+            if (ACTIVE_ALGO == SLA_AWARE && isStrictSLA(RequiredSLA(task_id)) &&
+                !isCompetitiveStrictMachine(machine_id, task_id)) {
+                continue;
+            }
+
             machines_sleeping.erase(machine_id);
             machines_waking.insert(machine_id);
             Machine_SetState(machine_id, S0);
@@ -1008,7 +1090,7 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
         auto it = tasks_waiting_for_machine.find(machine_id);
         if (it != tasks_waiting_for_machine.end()) {
             for (TaskId_t t : it->second) {
-                if (isSLA0(t)) {
+                if (isStrictSLA(RequiredSLA(t))) {
                     setPStateOfAllCoresOnMachine(machine_id, P0);
                     break;
                 }

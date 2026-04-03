@@ -4,6 +4,14 @@
 //
 //  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
 //
+//  SLA0 fixes applied:
+//  1. Priority global queue (SLA0 drained first)
+//  2. Aggressive sleep suppression for X86 machines
+//  3. SLA0 tasks never share VMs with non-SLA0 tasks (SLA_AWARE)
+//  4. Proactive P0 on SLA0 task placement
+//  5. SLA0 tasks bypass global queue and wake machines immediately
+//  6. scoreExistingVM penalizes mixed-SLA VMs heavily for SLA0 tasks
+//
 
 #include "Scheduler.hpp"
 #include <vector>
@@ -22,10 +30,11 @@ const MachineId_t NO_VALID_MACHINE = numeric_limits<MachineId_t>::max();
 const VMId_t NO_VALID_VM = numeric_limits<VMId_t>::max();
 
 const unsigned MEM_BUFFER = 16;
-const unsigned IDLE_TO_S0I1_CHECKS = 1;
-const unsigned IDLE_TO_S1_CHECKS   = 3;
-const unsigned IDLE_TO_S3_CHECKS   = 6;
-const unsigned IDLE_TO_S5_CHECKS   = 10;
+
+const unsigned IDLE_TO_S0I1_CHECKS = 4;   
+const unsigned IDLE_TO_S1_CHECKS   = 8;   
+const unsigned IDLE_TO_S3_CHECKS   = 14;  
+const unsigned IDLE_TO_S5_CHECKS   = 22;  
 
 const double CONSOLIDATE_LOW_UTIL  = 0.25;
 const double CONSOLIDATE_HIGH_UTIL = 0.80;
@@ -38,7 +47,7 @@ enum AlgorithmKind {
 };
 
 // change for the diff algos
-const AlgorithmKind ACTIVE_ALGO = THRESHOLD_CONSOLIDATION;
+const AlgorithmKind ACTIVE_ALGO = GREEDY_BEST_FIT;
 
 struct VMRecord {
     bool migrating = false;
@@ -52,7 +61,9 @@ struct VMRecord {
 unordered_map<VMId_t, VMRecord> map_vm_records;
 unordered_map<TaskId_t, VMId_t> map_task_to_vm;
 unordered_map<MachineId_t, deque<TaskId_t>> tasks_waiting_for_machine;
-deque<TaskId_t> global_waiting_tasks;
+
+deque<TaskId_t> urgent_waiting_tasks;   
+deque<TaskId_t> normal_waiting_tasks;  
 
 unordered_set<MachineId_t> machines_waking;
 unordered_set<MachineId_t> machines_sleeping;
@@ -81,6 +92,10 @@ Priority_t findPriority(SLAType_t sla) {
 
 bool isStrictSLA(SLAType_t sla) {
     return (sla == SLA0 || sla == SLA1);
+}
+
+bool isSLA0(TaskId_t task_id) {
+    return RequiredSLA(task_id) == SLA0;
 }
 
 bool isMachineReadyNow(MachineId_t machine_id) {
@@ -125,6 +140,24 @@ bool vmHasStrictTasks(const VMRecord& vmr) {
         if (isStrictSLA(RequiredSLA(t))) return true;
     }
     return false;
+}
+
+bool vmHasOnlySLA0Tasks(const VMRecord& vmr) {
+    for (TaskId_t t : vmr.tasks) {
+        if (RequiredSLA(t) != SLA0) return false;
+    }
+    return true;
+}
+
+bool machineHostsOnlySLA0Work(MachineId_t machine_id) {
+    for (auto& kv : map_vm_records) {
+        const VMRecord& vmr = kv.second;
+        if (vmr.machine_id != machine_id) continue;
+        for (TaskId_t t : vmr.tasks) {
+            if (RequiredSLA(t) != SLA0) return false;
+        }
+    }
+    return true;
 }
 
 bool vmHasGpuTasks(const VMRecord& vmr) {
@@ -174,10 +207,26 @@ int scoreExistingVM(const VMRecord& vmr, TaskId_t task_id) {
 
     if (ACTIVE_ALGO == SLA_AWARE) {
         SLAType_t sla = RequiredSLA(task_id);
-        if (isStrictSLA(sla)) {
-            score += static_cast<int>(m.active_tasks) * 40;
-            if (vmHasStrictTasks(vmr)) score += 35;
+
+        if (sla == SLA0) {
+            if (!machineHostsOnlySLA0Work(vmr.machine_id)) {
+                score += 600;
+            }
+            if (!vmHasOnlySLA0Tasks(vmr)) {
+                score += 300;
+            }
+            if (vmHasStrictTasks(vmr)) score -= 60;
+            score += static_cast<int>(m.active_tasks) * 30;
+            if (m.active_tasks < m.num_cpus) score -= 40;
+        } else if (sla == SLA1) {
+            score += static_cast<int>(m.active_tasks) * 50;
+            if (vmHasStrictTasks(vmr)) score += 40;
+            if (m.active_tasks >= m.num_cpus / 2) score += 80;
         } else {
+
+            if (machineHostsOnlySLA0Work(vmr.machine_id)) {
+                score += 400;
+            }
             score -= 10;
         }
     }
@@ -244,12 +293,21 @@ int scoreNewMachine(MachineId_t machine_id, TaskId_t task_id, bool ready_only) {
         }
         case SLA_AWARE: {
             SLAType_t sla = RequiredSLA(task_id);
-            if (isStrictSLA(sla)) {
-                if (m.s_state != S0) score += 300;
+            if (sla == SLA0) {
+                if (m.s_state != S0) score += 800;
+                if (machineHostsOnlySLA0Work(machine_id) && m.active_tasks > 0) score -= 80;
+                if (!machineHostsOnlySLA0Work(machine_id)) score += 400;
+                if (m.active_tasks == 0) score -= 30;
+                if (m.active_tasks > 0 && m.active_tasks < m.num_cpus) score -= 50;
+                if (m.active_tasks >= m.num_cpus) score += 100; 
+                if (m.p_state != P0) score += 20;
+            } else if (sla == SLA1) {
+                if (m.s_state != S0) score += 250;
                 if (m.active_tasks == 0) score -= 60;
                 if (m.active_tasks >= m.num_cpus / 2) score += 80;
                 if (m.p_state != P0) score += 15;
             } else {
+                if (machineHostsOnlySLA0Work(machine_id) && m.active_tasks > 0) score += 500;
                 score -= 5;
             }
             break;
@@ -306,8 +364,12 @@ bool tryPlaceTaskOnVM(VMId_t vm_id, TaskId_t task_id) {
     map_task_to_vm[task_id] = vm_id;
     idle_checks_map[vmr.machine_id] = 0;
 
-    if (ACTIVE_ALGO == SLA_AWARE && isStrictSLA(RequiredSLA(task_id))) {
-        setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
+    if (ACTIVE_ALGO == SLA_AWARE) {
+        if (isSLA0(task_id)) {
+            setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
+        } else if (isStrictSLA(RequiredSLA(task_id))) {
+            setPStateOfAllCoresOnMachine(vmr.machine_id, P0);
+        }
     }
 
     return true;
@@ -419,10 +481,40 @@ void tryDrainMachineQueue(Time_t now, MachineId_t machine_id) {
 }
 
 void tryDrainGlobalQueue(Time_t now) {
-    size_t attempts = global_waiting_tasks.size();
-    while (attempts-- > 0 && !global_waiting_tasks.empty()) {
-        TaskId_t task_id = global_waiting_tasks.front();
-        global_waiting_tasks.pop_front();
+    size_t attempts = urgent_waiting_tasks.size();
+    while (attempts-- > 0 && !urgent_waiting_tasks.empty()) {
+        TaskId_t task_id = urgent_waiting_tasks.front();
+        urgent_waiting_tasks.pop_front();
+
+        if (tryScheduleTaskNow(task_id)) continue;
+
+        if (isSLA0(task_id)) {
+            MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
+            if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
+                queueTaskForMachine(task_id, sleeping);
+                continue;
+            }
+            MachineId_t waking = findCompatibleWakingMachine(task_id);
+            if (waking != NO_VALID_MACHINE) {
+                tasks_waiting_for_machine[waking].push_back(task_id);
+                continue;
+            }
+        } else {
+            MachineId_t sleeping = findBestMachineForNewVM(task_id, false);
+            if (sleeping != NO_VALID_MACHINE && !isMachineReadyNow(sleeping)) {
+                queueTaskForMachine(task_id, sleeping);
+                continue;
+            }
+        }
+
+        urgent_waiting_tasks.push_back(task_id);
+    }
+
+
+    attempts = normal_waiting_tasks.size();
+    while (attempts-- > 0 && !normal_waiting_tasks.empty()) {
+        TaskId_t task_id = normal_waiting_tasks.front();
+        normal_waiting_tasks.pop_front();
 
         if (tryScheduleTaskNow(task_id)) continue;
 
@@ -432,7 +524,15 @@ void tryDrainGlobalQueue(Time_t now) {
             continue;
         }
 
-        global_waiting_tasks.push_back(task_id);
+        normal_waiting_tasks.push_back(task_id);
+    }
+}
+
+void pushToWaitQueue(TaskId_t task_id) {
+    if (isStrictSLA(RequiredSLA(task_id))) {
+        urgent_waiting_tasks.push_back(task_id);
+    } else {
+        normal_waiting_tasks.push_back(task_id);
     }
 }
 
@@ -477,12 +577,13 @@ void decideMachinePerformance(MachineId_t machine_id) {
     if (m.s_state != S0 || m.active_tasks == 0) return;
 
     bool strict_present = false;
+    bool sla0_present = false;
     for (auto& kv : map_vm_records) {
         const VMRecord& vmr = kv.second;
         if (vmr.machine_id != machine_id) continue;
-        if (vmHasStrictTasks(vmr)) {
-            strict_present = true;
-            break;
+        if (vmHasStrictTasks(vmr)) strict_present = true;
+        for (TaskId_t t : vmr.tasks) {
+            if (isSLA0(t)) { sla0_present = true; break; }
         }
     }
 
@@ -493,8 +594,15 @@ void decideMachinePerformance(MachineId_t machine_id) {
             break;
 
         case SLA_AWARE:
-            if (strict_present || m.active_tasks >= m.num_cpus) setPStateOfAllCoresOnMachine(machine_id, P0);
-            else if (m.active_tasks > 0) setPStateOfAllCoresOnMachine(machine_id, P1);
+            if (sla0_present) {
+                setPStateOfAllCoresOnMachine(machine_id, P0);
+            } else if (strict_present) {
+                setPStateOfAllCoresOnMachine(machine_id, P0);
+            } else if (m.active_tasks >= m.num_cpus / 2) {
+                setPStateOfAllCoresOnMachine(machine_id, P0);
+            } else if (m.active_tasks > 0) {
+                setPStateOfAllCoresOnMachine(machine_id, P1);
+            }
             break;
 
         case GPU_FIRST:
@@ -518,12 +626,21 @@ void lowerIdleMachineState(MachineId_t machine_id) {
     if (machines_sleeping.count(machine_id)) return;
 
     MachineInfo_t m = Machine_GetInfo(machine_id);
+
     unsigned min_ready_x86 = 2;
-    if (ACTIVE_ALGO == SLA_AWARE) min_ready_x86 = 4;
-    if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) min_ready_x86 = 3;
+    if (ACTIVE_ALGO == SLA_AWARE)              min_ready_x86 = 6;  
+    if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) min_ready_x86 = 4;  
+    if (ACTIVE_ALGO == GREEDY_BEST_FIT)         min_ready_x86 = 3; 
+    if (ACTIVE_ALGO == GPU_FIRST)               min_ready_x86 = 3; 
 
     if (m.cpu == X86 && countReadyMachinesByCPU(X86) <= min_ready_x86) {
         return;
+    }
+
+    if (m.cpu == X86 && !urgent_waiting_tasks.empty()) {
+        for (TaskId_t t : urgent_waiting_tasks) {
+            if (RequiredCPUType(t) == X86) return; 
+        }
     }
 
     if (m.active_vms > 0 || m.active_tasks > 0) {
@@ -544,9 +661,14 @@ void lowerIdleMachineState(MachineId_t machine_id) {
             break;
 
         case SLA_AWARE:
-            if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
-            else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
-            else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            if (m.cpu == X86) {
+                if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
+                else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            } else {
+                if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
+                else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
+                else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
+            }
             break;
 
         case THRESHOLD_CONSOLIDATION:
@@ -624,22 +746,42 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
     if (tryScheduleTaskNow(task_id)) return;
 
-    MachineId_t sleeping_candidate = findBestMachineForNewVM(task_id, false);
-    if (sleeping_candidate != NO_VALID_MACHINE && !isMachineReadyNow(sleeping_candidate)) {
-        queueTaskForMachine(task_id, sleeping_candidate);
-        return;
-    }
+    if (isSLA0(task_id)) {
+        MachineId_t sleeping_candidate = findBestMachineForNewVM(task_id, false);
+        if (sleeping_candidate != NO_VALID_MACHINE && !isMachineReadyNow(sleeping_candidate)) {
+            queueTaskForMachine(task_id, sleeping_candidate);
+            return;
+        }
 
-    MachineId_t waking_machine = findCompatibleWakingMachine(task_id);
-    if (waking_machine != NO_VALID_MACHINE) {
-        tasks_waiting_for_machine[waking_machine].push_back(task_id);
-        return;
-    }
+        MachineId_t waking_machine = findCompatibleWakingMachine(task_id);
+        if (waking_machine != NO_VALID_MACHINE) {
+            tasks_waiting_for_machine[waking_machine].push_back(task_id);
+            return;
+        }
+        if (anyCompatibleMachineExists(task_id)) {
+            urgent_waiting_tasks.push_back(task_id);
+            SimOutput("Scheduler::NewTask(): urgent queue fallback for SLA0 task " + to_string(task_id), 2);
+            return;
+        }
+    } else {
 
-    if (anyCompatibleMachineExists(task_id)) {
-        global_waiting_tasks.push_back(task_id);
-        SimOutput("Scheduler::NewTask(): global queue fallback for task " + to_string(task_id), 2);
-        return;
+        MachineId_t sleeping_candidate = findBestMachineForNewVM(task_id, false);
+        if (sleeping_candidate != NO_VALID_MACHINE && !isMachineReadyNow(sleeping_candidate)) {
+            queueTaskForMachine(task_id, sleeping_candidate);
+            return;
+        }
+
+        MachineId_t waking_machine = findCompatibleWakingMachine(task_id);
+        if (waking_machine != NO_VALID_MACHINE) {
+            tasks_waiting_for_machine[waking_machine].push_back(task_id);
+            return;
+        }
+
+        if (anyCompatibleMachineExists(task_id)) {
+            pushToWaitQueue(task_id);
+            SimOutput("Scheduler::NewTask(): global queue fallback for task " + to_string(task_id), 2);
+            return;
+        }
     }
 
     ThrowException("Scheduler::NewTask(): no compatible machine type exists for task ", task_id);
@@ -817,7 +959,7 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
         woken++;
 
         if (isStrictSLA(RequiredSLA(task_id))) {
-            if (woken >= 2) break;
+            if (woken >= 3) break;
         } else {
             if (woken >= 1) break;
         }
@@ -835,6 +977,15 @@ void StateChangeComplete(Time_t time, MachineId_t machine_id) {
 
     if (info.s_state == S0) {
         machines_sleeping.erase(machine_id);
+        auto it = tasks_waiting_for_machine.find(machine_id);
+        if (it != tasks_waiting_for_machine.end()) {
+            for (TaskId_t t : it->second) {
+                if (isSLA0(t)) {
+                    setPStateOfAllCoresOnMachine(machine_id, P0);
+                    break;
+                }
+            }
+        }
         tryDrainMachineQueue(time, machine_id);
         tryDrainGlobalQueue(time);
     } else {

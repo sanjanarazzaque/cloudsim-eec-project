@@ -39,7 +39,7 @@ enum AlgorithmKind {
 };
 
 // change for the diff algos
-const AlgorithmKind ACTIVE_ALGO = SLA_AWARE;
+const AlgorithmKind ACTIVE_ALGO = GPU_FIRST;
 
 struct VMRecord {
     bool migrating = false;

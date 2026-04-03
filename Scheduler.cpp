@@ -38,7 +38,7 @@ enum AlgorithmKind {
 };
 
 // change for the diff algos
-const AlgorithmKind ACTIVE_ALGO = GREEDY_BEST_FIT;
+const AlgorithmKind ACTIVE_ALGO = THRESHOLD_CONSOLIDATION;
 
 struct VMRecord {
     bool migrating = false;
@@ -187,14 +187,15 @@ int scoreExistingVM(const VMRecord& vmr, TaskId_t task_id) {
             if (m.gpus) score -= 40;
             else score += 1000;
         } else {
-            if (m.gpus) score += 50;
+            if (m.gpus) score += 80;
         }
     }
 
     if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) {
         double util = machineUtilizationEstimate(vmr.machine_id);
-        if (util < CONSOLIDATE_LOW_UTIL) score -= 15;
-        if (util > CONSOLIDATE_HIGH_UTIL) score += 35;
+        if (util < 0.30) score -= 5;
+        if (util >= 0.30 && util <= 0.70) score -= 20;
+        if (util > 0.80) score += 50;
     }
 
     return score;
@@ -244,9 +245,10 @@ int scoreNewMachine(MachineId_t machine_id, TaskId_t task_id, bool ready_only) {
         case SLA_AWARE: {
             SLAType_t sla = RequiredSLA(task_id);
             if (isStrictSLA(sla)) {
-                if (m.s_state != S0) score += 200;
-                if (m.active_tasks == 0) score -= 30;
-                if (m.p_state != P0) score += 10;
+                if (m.s_state != S0) score += 300;
+                if (m.active_tasks == 0) score -= 60;
+                if (m.active_tasks >= m.num_cpus / 2) score += 80;
+                if (m.p_state != P0) score += 15;
             } else {
                 score -= 5;
             }
@@ -257,14 +259,16 @@ int scoreNewMachine(MachineId_t machine_id, TaskId_t task_id, bool ready_only) {
                 if (m.gpus) score -= 60;
                 else score += 1000;
             } else {
-                if (m.gpus) score += 60;
+                if (m.gpus) score += 100;
             }
             break;
         }
         case THRESHOLD_CONSOLIDATION: {
             double util = machineUtilizationEstimate(machine_id);
-            if (util < CONSOLIDATE_LOW_UTIL) score -= 25;
-            if (util > CONSOLIDATE_HIGH_UTIL) score += 40;
+            if (m.s_state != S0) score += 80;
+            if (m.active_tasks == 0) score -= 15;
+            if (util >= 0.30 && util <= 0.70) score -= 25;
+            if (util > 0.80) score += 50;
             break;
         }
     }
@@ -325,7 +329,11 @@ bool createAttachAndPlace(TaskId_t task_id, MachineId_t machine_id) {
         return false;
     }
 
-    VM_Attach(vm_id, machine_id);
+    try {
+        VM_Attach(vm_id, machine_id);
+    } catch (const runtime_error&) {
+        return false;
+    }
 
     VMRecord rec;
     rec.vm_id = vm_id;
@@ -510,7 +518,11 @@ void lowerIdleMachineState(MachineId_t machine_id) {
     if (machines_sleeping.count(machine_id)) return;
 
     MachineInfo_t m = Machine_GetInfo(machine_id);
-    if (m.cpu == X86 && countReadyMachinesByCPU(X86) <= 2) {
+    unsigned min_ready_x86 = 2;
+    if (ACTIVE_ALGO == SLA_AWARE) min_ready_x86 = 4;
+    if (ACTIVE_ALGO == THRESHOLD_CONSOLIDATION) min_ready_x86 = 3;
+
+    if (m.cpu == X86 && countReadyMachinesByCPU(X86) <= min_ready_x86) {
         return;
     }
 
@@ -538,8 +550,7 @@ void lowerIdleMachineState(MachineId_t machine_id) {
             break;
 
         case THRESHOLD_CONSOLIDATION:
-            if (idle_num >= IDLE_TO_S5_CHECKS && m.s_state != S5) target = S5;
-            else if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
+            if (idle_num >= IDLE_TO_S3_CHECKS && m.s_state != S3 && m.s_state != S4 && m.s_state != S5) target = S3;
             else if (idle_num >= IDLE_TO_S1_CHECKS && m.s_state == S0i1) target = S1;
             else if (idle_num >= IDLE_TO_S0I1_CHECKS && m.s_state == S0) target = S0i1;
             break;
@@ -568,49 +579,7 @@ bool canMigrateVMToMachine(const VMRecord& vmr, MachineId_t dst_machine) {
 }
 
 void tryConsolidateVMs() {
-    if (ACTIVE_ALGO != THRESHOLD_CONSOLIDATION) return;
-    if (control_migration) return;
-
-    VMId_t chosen_vm = NO_VALID_VM;
-    MachineId_t chosen_dst = NO_VALID_MACHINE;
-
-    for (auto& kv : map_vm_records) {
-        VMRecord& vmr = kv.second;
-        if (vmr.tasks.empty()) continue;
-        if (vmr.migrating) continue;
-        if (vmHasStrictTasks(vmr)) continue;
-
-        MachineInfo_t src = Machine_GetInfo(vmr.machine_id);
-        if (src.s_state != S0) continue;
-
-        double util = machineUtilizationEstimate(vmr.machine_id);
-        if (util > CONSOLIDATE_LOW_UTIL) continue;
-
-        for (unsigned i = 0; i < Machine_GetTotal(); i++) {
-            MachineId_t dst = static_cast<MachineId_t>(i);
-            if (!canMigrateVMToMachine(vmr, dst)) continue;
-
-            MachineInfo_t dst_info = Machine_GetInfo(dst);
-            double dst_util = machineUtilizationEstimate(dst);
-            if (dst_info.active_tasks == 0) continue;
-            if (dst_util >= CONSOLIDATE_HIGH_UTIL) continue;
-            if (vmHasGpuTasks(vmr) && !dst_info.gpus) continue;
-
-            chosen_vm = vmr.vm_id;
-            chosen_dst = dst;
-            break;
-        }
-
-        if (chosen_vm != NO_VALID_VM) break;
-    }
-
-    if (chosen_vm != NO_VALID_VM && chosen_dst != NO_VALID_MACHINE) {
-        map_vm_records[chosen_vm].migrating = true;
-        control_migration = true;
-        VM_Migrate(chosen_vm, chosen_dst);
-        SimOutput("tryConsolidateVMs(): migrating VM " + to_string(chosen_vm) +
-                  " to machine " + to_string(chosen_dst), 2);
-    }
+    return;
 }
 
 } // namespace
@@ -752,6 +721,7 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
         setPStateOfAllCoresOnMachine(machine_id, P0);
     }
 
+    unsigned woken = 0;
     for (unsigned i = 0; i < Machine_GetTotal(); i++) {
         MachineId_t candidate = static_cast<MachineId_t>(i);
         if (candidate == machine_id) continue;
@@ -767,7 +737,13 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 
         SimOutput("MemoryWarning(): proactively waking machine " +
                   to_string(candidate), 2);
-        break;
+
+        woken++;
+        if (info.cpu == X86) {
+            if (woken >= 2) break;
+        } else {
+            if (woken >= 1) break;
+        }
     }
 }
 
@@ -836,14 +812,14 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
         Machine_SetState(machine_id, S0);
 
         SimOutput("SLAWarning(): waking machine " + to_string(machine_id) +
-                " for SLA protection", 2);
+                  " for SLA protection", 2);
 
         woken++;
 
         if (isStrictSLA(RequiredSLA(task_id))) {
-            if (woken >= 2) break;   // wake 2 machines for SLA0/SLA1
+            if (woken >= 2) break;
         } else {
-            if (woken >= 1) break;   // keep old behavior for others
+            if (woken >= 1) break;
         }
     }
 }
